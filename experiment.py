@@ -36,6 +36,13 @@ DT        = 300.0             # time step [s]
 #   float  — fixed nu_h [m2 s-1]
 NU_H = "munk"
 
+# --- Vertical mixing ----------------------------------------------------------
+#   "constant" — nu_v = 1e-4, kappa_v = 1e-5 m2/s everywhere
+#   "pp81"     — Pacanowski & Philander (1981) Richardson-number mixing for
+#                momentum and tracers, with convective adjustment (0.1 m2/s
+#                where statically unstable); constants above as backgrounds
+VERTICAL_MIXING = "pp81"
+
 # --- Initial conditions -------------------------------------------------------
 #   "rest"       — uniform T_BG / S_BG, zero velocity
 #   "oras5_cold" — T/S from ORAS5, u = v = eta = 0  (recommended: most stable)
@@ -434,8 +441,9 @@ def main() -> None:
     raw    = _read_raw()
     grid   = _build_grid(raw)
     nu_h   = munk_viscosity(grid) if NU_H == "munk" else float(NU_H)
-    params = ModelParams(dt=DT, nu_h=nu_h)
-    print(f"  nu_h = {nu_h:.3g} m2/s  ({'Munk criterion' if NU_H == 'munk' else 'fixed'})")
+    params = ModelParams(dt=DT, nu_h=nu_h, vertical_mixing=VERTICAL_MIXING)
+    print(f"  nu_h = {nu_h:.3g} m2/s  ({'Munk criterion' if NU_H == 'munk' else 'fixed'})"
+          f"  vertical mixing: {VERTICAL_MIXING}")
     forcing_for = _make_forcing_provider(grid)
 
     # Build initial state(s)
@@ -464,6 +472,7 @@ def main() -> None:
     # Open output file and save t=0
     ds = _create_nc(OUTPUT_NC, grid)
     ds.nu_h = params.nu_h
+    ds.vertical_mixing = params.vertical_mixing
     _write_snapshot(ds, state)
     print(f"\nOutput: {OUTPUT_NC}  (t=0 saved)\n")
 

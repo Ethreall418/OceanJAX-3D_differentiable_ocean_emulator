@@ -22,6 +22,12 @@ Four groups of properties are verified:
        munk_viscosity matches beta*dx^3 at the row nearest the equator,
        scales as dx^3 with resolution, and ignores land columns.
 
+  5. Pacanowski-Philander (1981) vertical mixing
+       N² > 0 for stable stratification (z positive down); background
+       values without shear; exact coefficients at Ri = 1; convective
+       values where N² < 0; no shear dilution at walls; nu0 = 0 reduces
+       to constant mixing; convection overturns an unstable column.
+
 Running
 -------
     pytest OceanJAX/tests/test_mixing.py -v
@@ -36,7 +42,7 @@ import pytest
 
 from OceanJAX.grid import OceanGrid
 from OceanJAX.state import ModelParams, create_rest_state
-from OceanJAX.timeStepping import step
+from OceanJAX.timeStepping import step, run
 from OceanJAX.Physics.mixing import (
     implicit_vertical_mix,
     implicit_vertical_visc,
@@ -225,3 +231,111 @@ class TestMunkViscosity:
         land = OceanGrid.create((0.0, 20.0), (0.0, 40.0), z, 10, 10, bathymetry=H)
         sea  = OceanGrid.create((0.0, 20.0), (0.0, 40.0), z, 10, 10)
         assert munk_viscosity(land) < munk_viscosity(sea)
+
+
+# ---------------------------------------------------------------------------
+# 5. Pacanowski-Philander (1981) vertical mixing
+# ---------------------------------------------------------------------------
+
+def _pp81_grid(periodic_x=True):
+    z = np.array([10.0, 30.0, 50.0, 70.0, 90.0])          # uniform dz_w = 20 m
+    return OceanGrid.create((0.0, 10.0), (10.0, 20.0), z, 4, 4, periodic_x=periodic_x)
+
+
+def _column_fields(grid, dTdz, dudz):
+    """T linear in depth (S const), u linear in depth, v = 0."""
+    z  = np.asarray(grid.z_c, np.float64)
+    sh = (grid.Nx, grid.Ny, grid.Nz)
+    T  = jnp.asarray(np.broadcast_to(20.0 + dTdz * z, sh), jnp.float32)
+    S  = jnp.full(sh, 35.0)
+    u  = jnp.asarray(np.broadcast_to(dudz * z, sh), jnp.float32) * grid.mask_u
+    return T, S, u, jnp.zeros(sh)
+
+
+class TestPP81:
+
+    PARAMS = ModelParams(vertical_mixing="pp81")
+
+    def test_n2_positive_for_stable_stratification(self):
+        """z is positive downward: T decreasing with depth is stable."""
+        from OceanJAX.Physics.mixing import buoyancy_and_shear
+        grid = _pp81_grid()
+        T, S, u, v = _column_fields(grid, dTdz=-0.05, dudz=0.0)
+        n2, _ = buoyancy_and_shear(T, S, u, v, grid, self.PARAMS)
+        expected = self.PARAMS.g * self.PARAMS.alpha_T * 0.05       # -g α dT/dz
+        # float32 densities ~1025 kg m-3 limit N² to ~4e-4 relative accuracy
+        np.testing.assert_allclose(np.asarray(n2)[:, :, 1:-1], expected, rtol=1e-3)
+
+    def test_background_without_shear(self):
+        from OceanJAX.Physics.mixing import pp81_coefficients
+        grid = _pp81_grid()
+        T, S, u, v = _column_fields(grid, dTdz=-0.05, dudz=0.0)
+        kappa, nu_u, _ = pp81_coefficients(T, S, u, v, grid, self.PARAMS)
+        inner = (slice(None), slice(None), slice(1, -1))
+        np.testing.assert_allclose(np.asarray(kappa)[inner], self.PARAMS.kappa_v, rtol=1e-6)
+        np.testing.assert_allclose(np.asarray(nu_u)[inner], self.PARAMS.nu_v, rtol=1e-6)
+
+    def test_known_richardson_number(self):
+        """Uniform N² and S² with Ri = 1: nu = nu0/36 + nu_b, kappa = nu0/216 + kappa_b."""
+        from OceanJAX.Physics.mixing import pp81_coefficients, richardson_number
+        p    = self.PARAMS
+        grid = _pp81_grid()
+        dTdz = -0.05
+        n2   = p.g * p.alpha_T * 0.05
+        T, S, u, v = _column_fields(grid, dTdz=dTdz, dudz=float(np.sqrt(n2)))
+        ri = np.asarray(richardson_number(T, S, u, v, grid, p))[:, :, 1:-1]
+        np.testing.assert_allclose(ri, 1.0, rtol=1e-3)
+        kappa, nu_u, _ = pp81_coefficients(T, S, u, v, grid, p)
+        np.testing.assert_allclose(np.asarray(nu_u)[:, :, 1:-1],
+                                   p.pp81_nu0 / 36.0 + p.nu_v, rtol=2e-3)
+        np.testing.assert_allclose(np.asarray(kappa)[:, :, 1:-1],
+                                   p.pp81_nu0 / 216.0 + p.kappa_v, rtol=2e-3)
+
+    def test_convective_when_unstable(self):
+        from OceanJAX.Physics.mixing import pp81_coefficients
+        grid = _pp81_grid()
+        T, S, u, v = _column_fields(grid, dTdz=+0.05, dudz=0.0)     # warm below
+        kappa, nu_u, nu_v = pp81_coefficients(T, S, u, v, grid, self.PARAMS)
+        for a in (kappa, nu_u):
+            np.testing.assert_allclose(np.asarray(a)[:, :, 1:-1], self.PARAMS.vmix_convective)
+
+    def test_shear_not_diluted_at_walls(self):
+        """Tracer columns next to a closed wall average only wet u-faces."""
+        from OceanJAX.Physics.mixing import buoyancy_and_shear
+        grid = _pp81_grid(periodic_x=False)
+        T, S, u, v = _column_fields(grid, dTdz=-0.05, dudz=0.01)
+        _, s2 = buoyancy_and_shear(T, S, u, v, grid, self.PARAMS)
+        s2 = np.asarray(s2)[:, :, 1:-1]
+        np.testing.assert_allclose(s2, 1e-4, rtol=1e-4)               # incl. i = 0, Nx-1
+
+    def test_zero_nu0_matches_constant_scheme(self):
+        """With nu0 = 0 on a stable column PP81 reduces to constant mixing."""
+        grid = _pp81_grid()
+        T, S, u, v = _column_fields(grid, dTdz=-0.05, dudz=0.02)
+        from OceanJAX.state import create_from_arrays
+        st = create_from_arrays(grid, u=u, v=v, T=T, S=S, eta=jnp.zeros((4, 4)))
+        a = step(st, grid, ModelParams(dt=300.0))
+        b = step(st, grid, ModelParams(dt=300.0, vertical_mixing="pp81", pp81_nu0=0.0))
+        for f in ("u", "v", "T", "S", "eta"):
+            np.testing.assert_allclose(np.asarray(getattr(a, f)),
+                                       np.asarray(getattr(b, f)), rtol=1e-6, atol=1e-9)
+
+    def test_convection_removes_static_instability(self):
+        """Warm-below column: PP81 overturns it within a day; constant does not."""
+        grid = _pp81_grid()
+        T, S, u, v = _column_fields(grid, dTdz=+0.05, dudz=0.0)
+        from OceanJAX.state import create_from_arrays
+        st0 = create_from_arrays(grid, u=u, v=v, T=T, S=S, eta=jnp.zeros((4, 4)))
+
+        def run_day(params):
+            final, _ = run(st0, grid, params, 288)
+            return np.asarray(final.T)[0, 0, :]
+
+        mixed = run_day(ModelParams(dt=300.0, vertical_mixing="pp81"))
+        const = run_day(ModelParams(dt=300.0))
+        assert np.ptp(mixed) < 0.01 * np.ptp(np.asarray(T)[0, 0, :])
+        assert np.all(np.diff(const) > 0), "constant mixing keeps the unstable profile"
+
+    def test_invalid_scheme_rejected(self):
+        with pytest.raises(ValueError, match="vertical_mixing"):
+            ModelParams(vertical_mixing="kpp")

@@ -39,6 +39,17 @@ class ModelParams(eqx.Module):
     kappa_h: float   # horizontal tracer diffusivity [m^2 s-1]
     kappa_v: float   # background vertical tracer diffusivity [m^2 s-1]
 
+    # ---- vertical mixing scheme -------------------------------------------
+    # "constant": nu_v / kappa_v everywhere.
+    # "pp81"    : Pacanowski & Philander (1981) Ri-dependent mixing with
+    #             nu_v / kappa_v as backgrounds, plus convective adjustment
+    #             (vmix_convective where N² < 0).  See mixing.pp81_coefficients.
+    vertical_mixing: str = eqx.field(static=True)
+    pp81_nu0:        float   # shear-mixing amplitude nu0 [m^2 s-1]
+    pp81_alpha:      float   # Ri coefficient alpha [-]
+    pp81_n:          float   # exponent n [-]
+    vmix_convective: float   # nu = kappa where statically unstable [m^2 s-1]
+
     # ---- bottom drag (quadratic, implicit) --------------------------------
     bottom_drag_cd:  float   # drag coefficient Cd [-]; 0 = free-slip bottom
     bottom_drag_ubg: float   # background speed for unresolved tides/eddies [m s-1]
@@ -70,6 +81,11 @@ class ModelParams(eqx.Module):
         nu_v: float = 1e-4,
         kappa_h: float = 100.0,
         kappa_v: float = 1e-5,
+        vertical_mixing: str = "constant",
+        pp81_nu0: float = 1e-2,
+        pp81_alpha: float = 5.0,
+        pp81_n: float = 2.0,
+        vmix_convective: float = 0.1,
         bottom_drag_cd: float = 1e-3,
         bottom_drag_ubg: float = 0.05,
         freezing_slope: float = 0.0575,
@@ -88,6 +104,15 @@ class ModelParams(eqx.Module):
         self.nu_v         = nu_v
         self.kappa_h      = kappa_h
         self.kappa_v      = kappa_v
+        if vertical_mixing not in ("constant", "pp81"):
+            raise ValueError(
+                f"vertical_mixing must be 'constant' or 'pp81'; got {vertical_mixing!r}"
+            )
+        self.vertical_mixing = vertical_mixing
+        self.pp81_nu0        = pp81_nu0
+        self.pp81_alpha      = pp81_alpha
+        self.pp81_n          = pp81_n
+        self.vmix_convective = vmix_convective
         self.bottom_drag_cd  = bottom_drag_cd
         self.bottom_drag_ubg = bottom_drag_ubg
         self.freezing_slope  = freezing_slope

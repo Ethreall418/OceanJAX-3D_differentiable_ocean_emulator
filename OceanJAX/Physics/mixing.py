@@ -34,8 +34,9 @@ bottom_drag_velocity      – quadratic drag velocity Cd*|u_b| at u/v points
 _laplacian_u / _v         – scalar Laplacian at u- / v-points with correct metrics
 horizontal_viscosity      – Laplacian viscosity tendency for (u, v)
 munk_viscosity            – resolution-dependent nu_h resolving the Munk layer
-richardson_number         – raw (unclipped) gradient Richardson number
-ri_based_diffusivity      – Richardson-number shear/convection diffusivity
+buoyancy_and_shear        – N² and S² aligned at tracer w-faces
+richardson_number         – gradient Richardson number (diagnostic, unclipped)
+pp81_coefficients         – Pacanowski–Philander (1981) nu, kappa + convection
 """
 
 from __future__ import annotations
@@ -586,8 +587,69 @@ def munk_viscosity(grid: OceanGrid, n_points: float = 1.0) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Richardson-number-based background diffusivity
+# Richardson number and Pacanowski-Philander (1981) vertical mixing
 # ---------------------------------------------------------------------------
+
+# Floor on S² [s⁻²]: with no shear, Ri = N² / floor is huge and PP81 falls
+# back to its background values.
+_S2_FLOOR: float = 1e-12
+
+
+def _face_mask(mask: jnp.ndarray) -> jnp.ndarray:
+    """(Nx, Ny, Nz+1): interior face k open when layers k-1 and k are both
+    wet in ``mask``; surface and seafloor faces closed."""
+    interior = mask[..., :-1] * mask[..., 1:]
+    zeros    = jnp.zeros(mask.shape[:2] + (1,), dtype=mask.dtype)
+    return jnp.concatenate([zeros, interior, zeros], axis=-1)
+
+
+def buoyancy_and_shear(
+    T:    jnp.ndarray,
+    S:    jnp.ndarray,
+    u:    jnp.ndarray,
+    v:    jnp.ndarray,
+    grid: OceanGrid,
+    params,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    N² and S² [s⁻²] at the w-faces of tracer columns, each (Nx, Ny, Nz+1).
+
+    z is positive downward (k increases with depth), so a stably stratified
+    column has rho[k] > rho[k-1] and
+
+      N²[k] = (g / rho0) * (rho[k] - rho[k-1]) / dz_w[k]      (> 0 stable)
+
+    Shear is formed where u and v live, squared, and averaged onto the
+    tracer column over its wet neighbouring faces, so that N² and S² sit at
+    the same point:
+
+      S²_c = mean_{i±1/2} (du/dz)²  +  mean_{j±1/2} (dv/dz)²
+
+    Averaging over wet faces only keeps coastal columns from being diluted
+    by the zero velocity of land faces.  Surface, seafloor and dry faces
+    are zero.
+    """
+    from OceanJAX.Physics.dynamics import equation_of_state  # deferred
+
+    safe_dz_w = jnp.where(grid.dz_w > 0, grid.dz_w, 1.0)
+    rho = equation_of_state(T, S, params)
+    n2  = (params.g / params.rho0) * _diff_w(rho) / safe_dz_w * grid.mask_w
+
+    mu = _face_mask(grid.mask_u)
+    mv = _face_mask(grid.mask_v)
+    su2 = (_diff_w(u * grid.mask_u) / safe_dz_w) ** 2 * mu
+    sv2 = (_diff_w(v * grid.mask_v) / safe_dz_w) ** 2 * mv
+
+    # u faces of tracer column i: i+1/2 (index i) and i-1/2 (index i-1)
+    su2_w, mu_w = jnp.roll(su2, 1, axis=0), jnp.roll(mu, 1, axis=0)
+    # v faces of tracer column j: j+1/2 (index j) and j-1/2 (index j-1, wall at j=0)
+    pad = lambda a: jnp.concatenate([jnp.zeros_like(a[:, :1]), a[:, :-1]], axis=1)
+    sv2_s, mv_s = pad(sv2), pad(mv)
+
+    s2 = ((su2 + su2_w) / jnp.maximum(mu + mu_w, 1.0)
+          + (sv2 + sv2_s) / jnp.maximum(mv + mv_s, 1.0))
+    return n2, s2 * grid.mask_w
+
 
 def richardson_number(
     T:    jnp.ndarray,
@@ -598,118 +660,66 @@ def richardson_number(
     params,
 ) -> jnp.ndarray:
     """
-    Raw gradient Richardson number at w-faces (Nx, Ny, Nz+1).
+    Gradient Richardson number Ri = N² / S² at tracer w-faces (Nx, Ny, Nz+1).
 
-      Ri = N² / S²
-
-    where N² is the squared buoyancy frequency:
-
-      N² = -(g / rho0) * drho/dz   (positive = stably stratified, negative = unstable)
-
-    and S² is the velocity shear squared:
-
-      S² = (du/dz)² + (dv/dz)²
-
-    Both are evaluated at w-faces using centred differences.
-    A small floor on S² prevents division by zero, but the returned Ri is
-    **not clipped**: negative values indicate static instability and must
-    be preserved for diagnostic use.  Closures that need a bounded Ri
-    (e.g. ``ri_based_diffusivity``) apply their own clamping internally.
-
-    Args:
-        T, S   : (Nx, Ny, Nz) temperature and salinity
-        u, v   : (Nx, Ny, Nz) horizontal velocities
-        grid   : OceanGrid
-        params : ModelParams
-
-    Returns:
-        Ri : (Nx, Ny, Nz+1), raw (possibly negative), zeroed at dry w-faces
+    Diagnostic, unclipped: negative Ri marks static instability.  S² is
+    floored at 1e-12 s⁻² (see ``buoyancy_and_shear`` for the staggering).
+    Dry and boundary faces are zero.
     """
-    from OceanJAX.Physics.dynamics import equation_of_state  # deferred
-
-    rho       = equation_of_state(T, S, params)   # (Nx, Ny, Nz)
-    safe_dz_w = jnp.where(grid.dz_w > 0, grid.dz_w, 1.0)
-
-    drho_dz = _diff_w(rho) / safe_dz_w
-    du_dz   = _diff_w(u)   / safe_dz_w
-    dv_dz   = _diff_w(v)   / safe_dz_w
-
-    n2 = -(params.g / params.rho0) * drho_dz
-    s2 = du_dz ** 2 + dv_dz ** 2
-
-    # Return raw Ri; no clipping — negative Ri signals static instability
-    ri = n2 / jnp.where(s2 > 1e-10, s2, 1e-10)
-    return ri * grid.mask_w
+    n2, s2 = buoyancy_and_shear(T, S, u, v, grid, params)
+    return n2 / jnp.maximum(s2, _S2_FLOOR) * grid.mask_w
 
 
-# ---------------------------------------------------------------------------
-# Simplified KPP vertical diffusivity
-# ---------------------------------------------------------------------------
-
-def ri_based_diffusivity(
-    T:     jnp.ndarray,
-    S:     jnp.ndarray,
-    u:     jnp.ndarray,
-    v:     jnp.ndarray,
-    grid:  OceanGrid,
+def pp81_coefficients(
+    T:      jnp.ndarray,
+    S:      jnp.ndarray,
+    u:      jnp.ndarray,
+    v:      jnp.ndarray,
+    grid:   OceanGrid,
     params,
-    kappa_0:    float = 1e-5,
-    kappa_conv: float = 1e-1,
-    ri_crit:    float = 0.7,
-) -> jnp.ndarray:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Richardson-number-based vertical diffusivity for tracers.
+    Pacanowski & Philander (1981) vertical viscosity and diffusivity.
 
-    Enhances a background diffusivity with shear-driven mixing when the
-    gradient Richardson number falls below a critical value, and applies
-    a convective-adjustment diffusivity in statically unstable layers:
+    For a stably stratified face (N² >= 0), with Ri = N² / S²:
 
-      kappa(k) = kappa_0
-               + kappa_conv * (1 - Ri / Ri_crit)²   if 0 <= Ri < Ri_crit
-               + kappa_conv                           if N² < 0  (convective)
+      nu    = nu0 / (1 + alpha Ri)^n            + nu_b
+      kappa = nu0 / (1 + alpha Ri)^(n+1)        + kappa_b
 
-    This is **not** a full KPP scheme (Large et al. 1994): it omits the
-    boundary-layer depth, counter-gradient fluxes, and nonlocal transport.
-    It provides a physically motivated background mixing suitable for
-    multi-year integrations and can be swapped for an ML closure
-    (``OceanJAX.ml.closure``) without changing the calling interface.
+    and for a statically unstable face (N² < 0) both take the convective
+    value ``params.vmix_convective`` (convective adjustment; stable for any
+    value because vertical mixing is implicit).  Parameters come from
+    ModelParams: pp81_nu0, pp81_alpha, pp81_n, vmix_convective, with the
+    constant-mixing values nu_v / kappa_v as backgrounds nu_b / kappa_b.
 
-    The raw Richardson number is computed internally.  Clamping to
-    [0, Ri_crit] is applied here, not in ``richardson_number``, so that
-    the diagnostic function preserves the full signed Ri signal.
+    PP81 is a local shear/stratification closure for the stratified
+    interior (designed for the tropical ocean).  It has no surface
+    boundary-layer physics (wind-driven deepening, nonlocal convection),
+    so mid/high-latitude mixed layers come out too shallow; it depends on
+    vertical, not horizontal, resolution.
 
-    Args:
-        T, S        : (Nx, Ny, Nz)
-        u, v        : (Nx, Ny, Nz)
-        grid        : OceanGrid
-        params      : ModelParams  (uses g, rho0)
-        kappa_0     : background diffusivity [m² s⁻¹]  (default 1e-5)
-        kappa_conv  : shear / convective diffusivity [m² s⁻¹]  (default 0.1)
-        ri_crit     : critical Richardson number for shear mixing (default 0.7)
-
-    Returns:
-        kappa : (Nx, Ny, Nz+1) [m² s⁻¹], zeroed at dry w-faces
+    Returns
+    -------
+    kappa : (Nx, Ny, Nz+1) tracer diffusivity at tracer w-faces [m² s⁻¹]
+    nu_u  : (Nx, Ny, Nz+1) viscosity at u-column w-faces
+    nu_v  : (Nx, Ny, Nz+1) viscosity at v-column w-faces
     """
-    # Reuse the diagnostic Ri, then clamp internally for the closure
-    ri = richardson_number(T, S, u, v, grid, params)   # raw, possibly negative
+    n2, s2 = buoyancy_and_shear(T, S, u, v, grid, params)
+    stable = n2 >= 0.0
+    ri     = jnp.where(stable, n2 / jnp.maximum(s2, _S2_FLOOR), 0.0)
+    f      = 1.0 / (1.0 + params.pp81_alpha * ri)
+    shear  = params.pp81_nu0 * f ** params.pp81_n
 
-    # N² is needed separately to detect convective instability
-    from OceanJAX.Physics.dynamics import equation_of_state  # deferred
-    rho = equation_of_state(T, S, params)
+    conv  = params.vmix_convective
+    nu    = jnp.where(stable, shear + params.nu_v, conv) * grid.mask_w
+    kappa = jnp.where(stable, shear * f + params.kappa_v, conv) * grid.mask_w
 
-    safe_dz_w = jnp.where(grid.dz_w > 0, grid.dz_w, 1.0)
-    n2 = -(params.g / params.rho0) * _diff_w(rho) / safe_dz_w
-
-    # Shear enhancement: (1 - Ri/Ri_crit)² for 0 <= Ri < Ri_crit
-    ri_clamped    = jnp.clip(ri, 0.0, ri_crit)
-    shear_factor  = jnp.where(
-        (ri >= 0.0) & (ri < ri_crit),
-        (1.0 - ri_clamped / ri_crit) ** 2,
-        0.0,
-    )
-
-    # Convective adjustment: N² < 0
-    conv_factor = jnp.where(n2 < 0.0, 1.0, 0.0)
-
-    kappa = kappa_0 + kappa_conv * (shear_factor + conv_factor)
-    return kappa * grid.mask_w
+    # Viscosity at u / v columns: mean of the adjacent tracer columns over
+    # their wet faces (the velocity solver applies its own face mask).
+    mw   = grid.mask_w
+    nu_e, mw_e = jnp.roll(nu, -1, axis=0), jnp.roll(mw, -1, axis=0)
+    nu_n = jnp.concatenate([nu[:, 1:], nu[:, -1:]], axis=1)
+    mw_n = jnp.concatenate([mw[:, 1:], mw[:, -1:]], axis=1)
+    nu_u = (nu + nu_e) / jnp.maximum(mw + mw_e, 1.0)
+    nu_v = (nu + nu_n) / jnp.maximum(mw + mw_n, 1.0)
+    return kappa, nu_u, nu_v

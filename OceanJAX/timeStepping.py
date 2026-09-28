@@ -93,6 +93,7 @@ from OceanJAX.Physics.mixing import (
     implicit_vertical_visc,
     implicit_vertical_mix,
     bottom_drag_velocity,
+    pp81_coefficients,
 )
 
 
@@ -204,7 +205,8 @@ def step(
     3.  Leapfrog momentum advance:  u_new = u_prev + 2*dt * G_u
     4.  Asselin-Robert filter on u(n):
           u_filt = u + alpha*(u_new - 2*u + u_prev)
-    5.  Implicit vertical viscosity + quadratic bottom drag on u_new, v_new.
+    5.  Vertical mixing coefficients (constant or PP81); implicit vertical
+        viscosity + quadratic bottom drag on u_new, v_new.
     6.  Diagnose w from (u_filt, v_filt), bottom-up; w[0] = -deta/dt.
     7.  Explicit tracer tendencies (advection with u_filt, v_filt, w
         + horiz. diffusion) + heat / freshwater surface forcing.
@@ -270,13 +272,23 @@ def step(
 
     # ------------------------------------------------------------------
     # 5. Implicit vertical viscosity + quadratic bottom drag
-    #    Drag velocity Cd*|u_b| is evaluated at time n (semi-implicit) and
-    #    applied implicitly to the deepest wet cell of each column, so it
-    #    is unconditionally stable.  bottom_drag_cd = 0 disables it.
+    #    Vertical mixing coefficients are evaluated at time level n:
+    #      "constant": params.nu_v / params.kappa_v everywhere;
+    #      "pp81"    : Ri-dependent Pacanowski-Philander + convection
+    #                  (kappa_vmix is reused for the tracers in step 9).
+    #    Drag velocity Cd*|u_b| is also evaluated at time n (semi-implicit)
+    #    and applied implicitly to the deepest wet cell of each column, so
+    #    it is unconditionally stable.  bottom_drag_cd = 0 disables it.
     # ------------------------------------------------------------------
+    if params.vertical_mixing == "pp81":
+        kappa_vmix, nu_u, nu_v = pp81_coefficients(
+            state.T, state.S, state.u, state.v, grid, params)
+    else:
+        kappa_vmix, nu_u, nu_v = params.kappa_v, params.nu_v, params.nu_v
+
     drag_u, drag_v = bottom_drag_velocity(state.u, state.v, grid, params)
-    u_new = implicit_vertical_visc(u_new, params.nu_v, dt, grid, grid.mask_u, drag_u)
-    v_new = implicit_vertical_visc(v_new, params.nu_v, dt, grid, grid.mask_v, drag_v)
+    u_new = implicit_vertical_visc(u_new, nu_u, dt, grid, grid.mask_u, drag_u)
+    v_new = implicit_vertical_visc(v_new, nu_v, dt, grid, grid.mask_v, drag_v)
 
     # ------------------------------------------------------------------
     # 6. Diagnose w from the Asselin-filtered velocities
@@ -308,9 +320,9 @@ def step(
         corr    = closure(state, grid, params)
         G_T     = (G_T + corr.dT_tend) * grid.mask_c
         G_S     = (G_S + corr.dS_tend) * grid.mask_c
-        kappa_v = params.kappa_v * corr.kappa_v_scale
+        kappa_v = kappa_vmix * corr.kappa_v_scale
     else:
-        kappa_v = params.kappa_v
+        kappa_v = kappa_vmix
 
     # ------------------------------------------------------------------
     # 8. Adams-Bashforth 3 tracer advance
@@ -333,8 +345,8 @@ def step(
 
     # ------------------------------------------------------------------
     # 9. Implicit vertical diffusion
-    #    kappa_v is either params.kappa_v (pure physics) or
-    #    params.kappa_v * corr.kappa_v_scale (when closure is active).
+    #    kappa_v is the scheme diffusivity (params.kappa_v, or the PP81
+    #    field), times corr.kappa_v_scale when a closure is active.
     # ------------------------------------------------------------------
     T_new = implicit_vertical_mix(T_new, kappa_v, dt, grid,
                                   rhs_explicit=jnp.zeros_like(T_new))
