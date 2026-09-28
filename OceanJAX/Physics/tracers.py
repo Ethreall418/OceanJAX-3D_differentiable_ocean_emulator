@@ -13,11 +13,17 @@ explicit and implicit pieces without double-counting.
 
 Vertical-face / surface-forcing division of labour
 ---------------------------------------------------
-Tracer advection uses ``grid.mask_w_adv``, which closes the surface face
-(k=0) for all advective fluxes.  The surface is therefore a hard wall for
-advection, and every surface tracer exchange must be routed through the
-explicit forcing tendencies at the bottom of this module.  This makes the
-two contributions mutually exclusive by construction.
+Tracer advection uses ``grid.mask_w``, whose surface face (k=0) is open
+wherever the top cell is wet.  With a linear free surface the layer
+thicknesses are fixed, so the kinematic flux w[0] * C[0] through the
+surface is what lets a column exchange volume with the (unresolved)
+eta-layer: it makes every cell exactly non-divergent and keeps a uniform
+tracer uniform.  The conserved quantity is  sum(C*V) + sum(eta*C_surf*A).
+
+This is a volume flux, not an air-sea exchange: all physical surface
+fluxes (heat, virtual salt) still enter only through the explicit forcing
+tendencies at the bottom of this module, and implicit vertical diffusion
+keeps the surface face closed via ``grid.mask_w_adv``.
 
 Governing equation (Boussinesq, per unit volume):
 
@@ -34,7 +40,7 @@ Flux-form advection:
   Fw = w * C_face *  area_c           horizontal cell area
 
 All fluxes are gated by the appropriate face mask
-(mask_u, mask_v, mask_w_adv).
+(mask_u, mask_v, mask_w).
 """
 
 from __future__ import annotations
@@ -57,9 +63,9 @@ def _vertical_face_values(phi: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
     Build per-face arrays for the cell above and below each w-face.
 
       above_w[:,:,k] = phi[:,:,k-1]   for k = 1..Nz  (cell above face k)
-                     = phi[:,:,0]     for k = 0       (masked out by mask_w_adv)
+                     = phi[:,:,0]     for k = 0       (surface: top-cell value)
       below_w[:,:,k] = phi[:,:,k]     for k = 0..Nz-1 (cell below face k)
-                     = phi[:,:,Nz-1]  for k = Nz      (masked out by mask_w_adv)
+                     = phi[:,:,Nz-1]  for k = Nz      (masked out by mask_w)
 
     Returns (above_w, below_w), each shape (Nx, Ny, Nz+1).
     """
@@ -88,9 +94,9 @@ def upwind_advection(
       north face (j+1/2): phi[j]   if v >= 0  (northward), else phi[j+1]
       top   face (k):     phi[k-1] if w >= 0  (downward),  else phi[k]
 
-    The surface vertical face (k=0) is closed via ``grid.mask_w_adv``
-    so that no advective flux crosses the sea surface; surface tracer
-    exchange is handled by the explicit forcing tendencies.
+    The surface vertical face (k=0) carries the linear free-surface
+    kinematic flux w[0] * phi[0] (see module docstring); the seafloor
+    face is closed via ``grid.mask_w``.
 
     Args:
         phi : (Nx, Ny, Nz)    tracer at cell centres
@@ -119,13 +125,13 @@ def upwind_advection(
         [jnp.zeros((grid.Nx, 1, grid.Nz), dtype=phi.dtype), Fv_n[:, :-1, :]], axis=1
     )
 
-    # ---- Vertical flux (top face k, using mask_w_adv) ----------------------
+    # ---- Vertical flux (top face k, using mask_w) ---------------------------
     # w > 0 (downward): upwind source is the cell above (above_w)
     # w < 0 (upward):   upwind source is the cell below (below_w)
-    # Surface face (k=0) is zeroed by mask_w_adv.
+    # Surface face (k=0) uses the top-cell value either way.
     above_w, below_w = _vertical_face_values(phi)
     C_w  = jnp.where(w >= 0, above_w, below_w)
-    Fw   = w * grid.mask_w_adv * C_w * grid.area_c[:, :, jnp.newaxis]
+    Fw   = w * grid.mask_w * C_w * grid.area_c[:, :, jnp.newaxis]
     Fw_t = Fw[:, :, :-1]   # top-face flux of cell k  (w-face k)
     Fw_b = Fw[:, :, 1:]    # bottom-face flux of cell k (w-face k+1)
 
@@ -166,9 +172,9 @@ def centered_advection(
         [jnp.zeros((grid.Nx, 1, grid.Nz), dtype=phi.dtype), Fv_n[:, :-1, :]], axis=1
     )
 
-    # ---- Vertical (surface face zeroed by mask_w_adv) ----
+    # ---- Vertical (surface face carries the kinematic flux) ----
     above_w, below_w = _vertical_face_values(phi)
-    Fw    = w * grid.mask_w_adv * 0.5 * (above_w + below_w) * grid.area_c[:, :, jnp.newaxis]
+    Fw    = w * grid.mask_w * 0.5 * (above_w + below_w) * grid.area_c[:, :, jnp.newaxis]
     Fw_t  = Fw[:, :, :-1]
     Fw_b  = Fw[:, :, 1:]
 
@@ -282,9 +288,9 @@ def surface_layer_tendency(
     """
     Generic surface flux tendency applied to the top tracer layer (k=0).
 
-    This is the only sanctioned pathway for tracer exchange through the sea
-    surface.  Tracer advection is hard-walled at k=0 via mask_w_adv, so
-    adding a tendency here does not double-count any advective flux.
+    This is the only sanctioned pathway for air-sea tracer exchange.  The
+    advective surface flux w[0]*C[0] is a free-surface volume flux, not an
+    air-sea flux, so adding a tendency here does not double-count it.
 
     Args:
         flux_per_area : (Nx, Ny) [tracer · m · s-1]

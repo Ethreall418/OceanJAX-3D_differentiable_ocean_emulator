@@ -23,7 +23,7 @@ import pytest
 import xarray as xr
 
 from OceanJAX.grid import OceanGrid
-from OceanJAX.data.oras5 import read_oras5, regrid_to_model, load_oras5
+from OceanJAX.data.oras5 import read_oras5, regrid_to_model, load_oras5, oras5_bathymetry
 
 
 # ---------------------------------------------------------------------------
@@ -743,3 +743,76 @@ class TestFieldSpecificHoriz:
         grid  = _target_grid()
         state = regrid_to_model(read_oras5(nc), grid)
         assert state.u.shape == (grid.Nx, grid.Ny, grid.Nz)
+
+
+# ---------------------------------------------------------------------------
+# oras5_bathymetry — land/sea mask and water depth from ORAS5 NaN pattern
+# ---------------------------------------------------------------------------
+
+_BATHY_DEPTH = np.array([5.0, 15.0, 30.0, 60.0, 100.0])
+# Faces by the OceanGrid.create rule: 0, 10, 22.5, 45, 80, 110
+
+
+def _bathy_raw(curvilinear: bool = False, lon0: float = 0.0) -> dict:
+    """
+    Synthetic 0.25° source on lon [lon0, lon0+10], lat [0, 8]:
+      lon < lon0+3.5           : land (all NaN)
+      lat < 4                  : wet in the top 3 levels  -> depth 45 m
+      lat >= 4                 : wet in all 5 levels      -> depth 110 m
+    One column also has a wet level *below* a dry one, which must not
+    count (wetness is taken contiguously from the surface).
+    """
+    lon = lon0 + np.arange(0.125, 10.0, 0.25)
+    lat = np.arange(0.125, 8.0, 0.25)
+    T = np.full((len(_BATHY_DEPTH), len(lat), len(lon)), 20.0, dtype=np.float32)
+    T[:, :, lon < lon0 + 3.5] = np.nan
+    T[3:, lat < 4.0, :] = np.nan
+    T[4, lat < 4.0, -1] = 20.0          # isolated wet cell under a dry level
+    raw = {"T": T, "depth": _BATHY_DEPTH.copy()}
+    if curvilinear:
+        lat2d, lon2d = np.meshgrid(lat, lon, indexing="ij")
+        raw.update(lon=lon2d, lat=lat2d)
+    else:
+        raw.update(lon=lon, lat=lat)
+    return raw
+
+
+def _bathy_grid(Nx=5, Ny=4, lon=(0.0, 10.0)) -> OceanGrid:
+    return OceanGrid.create(lon, (0.0, 8.0), np.array([5.0, 30.0, 70.0]), Nx, Ny)
+
+
+class TestOras5Bathymetry:
+
+    @pytest.mark.parametrize("curvilinear", [False, True])
+    def test_land_and_depths(self, curvilinear):
+        """2°×2° cells: majority-land cells are land, depths follow ORAS5."""
+        H = oras5_bathymetry(_bathy_raw(curvilinear), _bathy_grid())
+        assert H.shape == (5, 4)
+        # i=0 (lon 0-2) all land; i=1 (lon 2-4) 6/8 land -> land
+        assert np.all(H[:2] == 0.0)
+        # ocean columns: lat 0-4 -> 45 m, lat 4-8 -> 110 m
+        np.testing.assert_allclose(H[2:, :2], 45.0)
+        np.testing.assert_allclose(H[2:, 2:], 110.0)
+
+    def test_grid_mask_from_bathymetry(self):
+        """Feeding H back into OceanGrid.create gives the expected mask."""
+        H    = oras5_bathymetry(_bathy_raw(), _bathy_grid())
+        grid = OceanGrid.create((0.0, 10.0), (0.0, 8.0), np.array([5.0, 30.0, 70.0]),
+                                5, 4, bathymetry=H, periodic_x=False)
+        m = np.asarray(grid.mask_c)
+        assert np.all(m[:2] == 0.0)                        # land columns
+        # model faces 0, 17.5, 50, 90: H=45 -> 2 wet levels, H=110 -> 3
+        np.testing.assert_array_equal(m[2:, :2].sum(axis=-1), 2)
+        np.testing.assert_array_equal(m[2:, 2:].sum(axis=-1), 3)
+
+    def test_finer_target_uses_nearest(self):
+        """Target cells smaller than the source spacing get no NaN."""
+        H = oras5_bathymetry(_bathy_raw(), _bathy_grid(Nx=80, Ny=64))
+        assert np.all(np.isfinite(H))
+        assert H[0, 0] == 0.0 and H[-1, -1] == 110.0
+
+    def test_longitude_convention_mismatch(self):
+        """Source in 0-360, target in -180-180 (same physical region)."""
+        H = oras5_bathymetry(_bathy_raw(lon0=340.0), _bathy_grid(lon=(-20.0, -10.0)))
+        assert np.all(H[:2] == 0.0)
+        np.testing.assert_allclose(H[2:, 2:], 110.0)

@@ -21,12 +21,12 @@ Metrics recorded every SAVE_INTERVAL steps
 Pass criteria
 -------------
   T/S volume integrals
-    rel_drift < 5e-4 over 30 days
-    The Thomas-algorithm implicit solver introduces ~4× float32_eps (~4.8e-7)
-    per step on a uniform field.  Over 8640 steps this accumulates to ~4e-3
-    in absolute terms; the 5e-4 threshold is a conservative bound that still
-    confirms the drift is roundoff-level and not a physical instability.
-    Key diagnostic: drift must be LINEAR in time (R² > 0.999), not exponential.
+    rel_drift == 0 exactly over 30 days.
+    The implicit vertical solver works on the increment (mixing.
+    _solve_increment), whose right-hand side is built from differences only,
+    so a uniform column is reproduced bit-for-bit.  (The earlier full-field
+    Thomas solve added one float32 ulp to the bottom level on every step,
+    a linear drift of ~5e-6 /day that this test used to tolerate.)
 
   Velocity / free surface
     max_u, max_v < 1e-10 m/s  (effectively machine zero for float32)
@@ -162,38 +162,18 @@ max_v_all   = max(r["max_v"]   for r in records)
 max_eta_all = max(r["max_eta"] for r in records)
 KE_max      = max(r["KE"]      for r in records)
 
-print(f"Max rel T drift  : {rel_dT_max:.3e}   (threshold < 5e-4)")
-print(f"Max rel S drift  : {rel_dS_max:.3e}   (threshold < 5e-4)")
+print(f"Max rel T drift  : {rel_dT_max:.3e}   (must be exactly 0)")
+print(f"Max rel S drift  : {rel_dS_max:.3e}   (must be exactly 0)")
 print(f"Max |u|          : {max_u_all:.3e} m/s  (threshold < 1e-10)")
 print(f"Max |v|          : {max_v_all:.3e} m/s  (threshold < 1e-10)")
 print(f"Max |eta|        : {max_eta_all:.3e} m    (threshold < 1e-10)")
 print(f"Max KE           : {KE_max:.3e} J    (threshold < 1e-6)")
 print()
 
-# Linearity check: fit rel_dT vs day number, compute R²
-days   = np.array([r["day"]   for r in records])
-dT_arr = np.array([r["rel_dT"] for r in records])
-dS_arr = np.array([r["rel_dS"] for r in records])
-# Linear fit via least squares
-A = np.column_stack([days, np.ones_like(days)])
-slope_T, _ = np.linalg.lstsq(A, dT_arr, rcond=None)[0]
-slope_S, _ = np.linalg.lstsq(A, dS_arr, rcond=None)[0]
-resid_T = dT_arr - A @ np.linalg.lstsq(A, dT_arr, rcond=None)[0]
-resid_S = dS_arr - A @ np.linalg.lstsq(A, dS_arr, rcond=None)[0]
-r2_T = 1 - np.var(resid_T) / np.var(dT_arr)
-r2_S = 1 - np.var(resid_S) / np.var(dS_arr)
-print(f"T drift rate     : {slope_T:.3e} /day  (R²={r2_T:.6f})")
-print(f"S drift rate     : {slope_S:.3e} /day  (R²={r2_S:.6f})")
-print(f"  float32 eps/step estimate: ~{288 * 4.8e-7 / 15.0:.3e} /day — "
-      f"observed rate consistent: {abs(slope_T - 288*4.8e-7/15.0) < 1e-5}")
-print()
-
 # Evaluate pass/fail per criterion
 results = {
-    "T drift < 5e-4 (roundoff)"  : rel_dT_max  < 5e-4,
-    "S drift < 5e-4 (roundoff)"  : rel_dS_max  < 5e-4,
-    "T drift is linear (R²>0.999)": r2_T        > 0.999,
-    "S drift is linear (R²>0.999)": r2_S        > 0.999,
+    "T exactly conserved"        : rel_dT_max  == 0.0,
+    "S exactly conserved"        : rel_dS_max  == 0.0,
     "u exactly zero"             : max_u_all   < 1e-10,
     "v exactly zero"             : max_v_all   < 1e-10,
     "eta exactly zero"           : max_eta_all < 1e-10,

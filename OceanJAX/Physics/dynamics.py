@@ -25,9 +25,11 @@ Hydrostatic balance:
 Continuity (Boussinesq, incompressible):
   du/dx + dv/dy + dw/dz = 0
 
-Free surface (rigid-lid approximation for w-diagnostic; eta evolves via
-the barotropic tendency):
+Free surface (linear; layer thicknesses fixed, eta evolves via the
+barotropic tendency):
   deta/dt = -div_h(integral_0^H u dz, integral_0^H v dz)
+w is diagnosed upward from w = 0 at the seafloor, so the surface face
+carries the kinematic value w[0] = -deta/dt (w positive downward).
 
 Linear equation of state:
   rho = rho0 * (1 - alpha_T*(T - T_ref) + beta_S*(S - S_ref))
@@ -40,10 +42,11 @@ Contents
   pressure_gradient_v       – barotropic (-g∂eta/∂y) + baroclinic PGF at v-points
   coriolis_u                – +f*v tendency at u-points
   coriolis_v                – -f*u tendency at v-points
+  v_at_u_points / u_at_v_points – 4-point velocity interpolation (Coriolis, drag)
   momentum_tendency_u       – full explicit RHS for u
   momentum_tendency_v       – full explicit RHS for v
   free_surface_tendency     – deta/dt from depth-integrated divergence
-  compute_w                 – diagnose w from continuity (lax.scan)
+  compute_w                 – diagnose w from continuity, bottom-up (lax.scan)
 """
 
 from __future__ import annotations
@@ -237,6 +240,18 @@ def coriolis_u(
     Returns:
         (Nx, Ny, Nz) [m s-2], zeroed at dry u-faces
     """
+    # f_c is zonally invariant; broadcast from (Nx, Ny) to (Nx, Ny, Nz)
+    return grid.f_c[:, :, jnp.newaxis] * v_at_u_points(v, grid) * grid.mask_u
+
+
+def v_at_u_points(v: jnp.ndarray, grid: OceanGrid) -> jnp.ndarray:
+    """
+    4-point average of v at u-points (i+1/2, j):
+
+      v_at_u[i,j,k] = 0.25 * (v[i,j-1] + v[i,j] + v[i+1,j-1] + v[i+1,j])
+
+    Shared by the Coriolis term and the bottom drag.  Not masked by mask_u.
+    """
     # Explicitly mask v at dry v-faces before interpolation so that land
     # points contribute zero to the average rather than stale values.
     # (A normalised average dividing by the wet-neighbour count would avoid
@@ -256,10 +271,7 @@ def coriolis_u(
         [jnp.zeros((grid.Nx, 1, grid.Nz), dtype=v.dtype), v_e[:, :-1, :]], axis=1
     )
 
-    v_at_u = 0.25 * (v_m + v_s + v_e + v_e_s)              # (Nx, Ny, Nz)
-
-    # f_c is zonally invariant; broadcast from (Nx, Ny) to (Nx, Ny, Nz)
-    return grid.f_c[:, :, jnp.newaxis] * v_at_u * grid.mask_u
+    return 0.25 * (v_m + v_s + v_e + v_e_s)                 # (Nx, Ny, Nz)
 
 
 def coriolis_v(
@@ -286,6 +298,22 @@ def coriolis_v(
     Returns:
         (Nx, Ny, Nz) [m s-2], zeroed at dry v-faces
     """
+    # f at v-point: average in j; north Neumann (copy last value)
+    f_n = jnp.roll(grid.f_c, -1, axis=1)
+    f_n = f_n.at[:, -1].set(grid.f_c[:, -1])
+    f_v = 0.5 * (grid.f_c + f_n)               # (Nx, Ny)
+
+    return -f_v[:, :, jnp.newaxis] * u_at_v_points(u, grid) * grid.mask_v
+
+
+def u_at_v_points(u: jnp.ndarray, grid: OceanGrid) -> jnp.ndarray:
+    """
+    4-point average of u at v-points (i, j+1/2):
+
+      u_at_v[i,j,k] = 0.25 * (u[i-1,j] + u[i,j] + u[i-1,j+1] + u[i,j+1])
+
+    Shared by the Coriolis term and the bottom drag.  Not masked by mask_v.
+    """
     # Explicitly mask u at dry u-faces before interpolation (see coriolis_u).
     u_m = u * grid.mask_u                                   # (Nx, Ny, Nz)
 
@@ -297,14 +325,7 @@ def coriolis_v(
     u_n   = u_n.at[:, -1, :].set(0.0)
     u_w_n = jnp.roll(u_n, 1, axis=0)
 
-    u_at_v = 0.25 * (u_m + u_w + u_n + u_w_n)              # (Nx, Ny, Nz)
-
-    # f at v-point: average in j; north Neumann (copy last value)
-    f_n = jnp.roll(grid.f_c, -1, axis=1)
-    f_n = f_n.at[:, -1].set(grid.f_c[:, -1])
-    f_v = 0.5 * (grid.f_c + f_n)               # (Nx, Ny)
-
-    return -f_v[:, :, jnp.newaxis] * u_at_v * grid.mask_v
+    return 0.25 * (u_m + u_w + u_n + u_w_n)                 # (Nx, Ny, Nz)
 
 
 # ---------------------------------------------------------------------------
@@ -448,15 +469,23 @@ def compute_w(
     """
     Diagnose vertical velocity w from the incompressibility constraint.
 
-    Integrates the continuity equation downward from the surface:
+    w is positive **downward** (same convention as the tracer advection
+    and grad_z).  The continuity equation is integrated upward from the
+    seafloor:
 
-      w[k+1] = w[k] - div_h(u, v)[k] * dz_c[k]
+      w[Nz] = 0                                   (no-normal-flow bottom)
+      w[k]  = w[k+1] + div_h(u, v)[k] * dz_c[k]
 
-    with the surface boundary condition w[0] = 0 (rigid-lid kinematic
-    BC for the advection solver; see mask_w_adv).  For a free-surface
-    model the correct w[0] = deta/dt is set by the time stepper after
-    this function returns, but mask_w_adv zeroes the surface face for
-    tracer advection regardless.
+    so that every cell, including the surface and bottom layers, satisfies
+    div_h + (w[k+1] - w[k]) / dz_c = 0 exactly.  Dry cells below the local
+    bathymetry have zero divergence, so w vanishes at the bottom face of
+    the deepest wet cell of each column.
+
+    The surface value is then the linear free-surface kinematic condition
+
+      w[0] = sum_k div_h[k] * dz_c[k] = -deta/dt
+
+    (a rising surface corresponds to upward, i.e. negative, w).
 
     The horizontal divergence is computed in flux form using the same
     area metrics as div_h in operators.py, ensuring consistency with
@@ -482,26 +511,26 @@ def compute_w(
 
     div_uv = (dFu + dFv) / grid.area_c[:, :, jnp.newaxis]   # (Nx, Ny, Nz)
 
-    # Downward increment: dw[k] = -div_uv[k] * dz_c[k]
-    dw = -div_uv * grid.dz_c                                  # (Nx, Ny, Nz)
+    # Upward increment across layer k: w[k] - w[k+1] = div_uv[k] * dz_c[k]
+    dw = div_uv * grid.mask_c * grid.dz_c                     # (Nx, Ny, Nz)
 
-    def _step(w_k, dw_k):
+    def _step(w_bot, dw_k):
         """
-        w_k  : w at the top face of the current layer, (Nx, Ny)
-        dw_k : w increment for this layer (= -div_uv*dz), (Nx, Ny)
-        Returns w at the bottom face (= top of next layer), and saves w_k.
+        w_bot : w at the bottom face of the current layer, (Nx, Ny)
+        dw_k  : div_uv*dz for this layer, (Nx, Ny)
+        Returns w at the top face (= bottom of the layer above) twice:
+        once as the new carry, once as the saved output.
         """
-        w_next = w_k + dw_k
-        return w_next, w_k
+        w_top = w_bot + dw_k
+        return w_top, w_top
 
-    # lax.scan over k; initial carry = w[0] = 0 (rigid-lid surface BC)
-    dw_T = jnp.moveaxis(dw, -1, 0)                           # (Nz, Nx, Ny)
-    w_bottom, w_tops_T = jax.lax.scan(
+    # lax.scan over k from the bottom layer upward; initial carry w[Nz] = 0
+    dw_T = jnp.moveaxis(dw, -1, 0)[::-1]                     # (Nz, Nx, Ny), k = Nz-1 .. 0
+    _, w_tops_rev = jax.lax.scan(
         _step, jnp.zeros((grid.Nx, grid.Ny), dtype=u.dtype), dw_T
     )
-    # w_tops_T : (Nz, Nx, Ny) = [w[0], w[1], ..., w[Nz-1]]
-    # w_bottom : (Nx, Ny)     = w[Nz] (should be ~0 for consistent u,v)
-
-    w_tops = jnp.moveaxis(w_tops_T, 0, -1)                   # (Nx, Ny, Nz)
-    w = jnp.concatenate([w_tops, w_bottom[:, :, jnp.newaxis]], axis=-1)  # (Nx,Ny,Nz+1)
+    # w_tops_rev : (Nz, Nx, Ny) = [w[Nz-1], ..., w[1], w[0]]
+    w_tops = jnp.moveaxis(w_tops_rev[::-1], 0, -1)           # (Nx, Ny, Nz)
+    w_bottom = jnp.zeros((grid.Nx, grid.Ny, 1), dtype=u.dtype)
+    w = jnp.concatenate([w_tops, w_bottom], axis=-1)          # (Nx, Ny, Nz+1)
     return w * grid.mask_w

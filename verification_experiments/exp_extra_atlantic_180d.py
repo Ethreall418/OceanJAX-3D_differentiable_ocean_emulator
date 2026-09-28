@@ -52,7 +52,8 @@ import netCDF4 as nc_lib
 from OceanJAX.grid import OceanGrid
 from OceanJAX.state import ModelParams, create_from_arrays
 from OceanJAX.data.oras5 import (read_oras5, regrid_to_model,
-                                  read_oras5_forcing, regrid_forcing)
+                                  read_oras5_forcing, regrid_forcing, oras5_grid)
+from OceanJAX.Physics.mixing import munk_viscosity
 from OceanJAX.timeStepping import SurfaceForcing, run
 
 # ---------------------------------------------------------------------------
@@ -91,11 +92,17 @@ print(f"  Run    : {N_DAYS} days  ({TOTAL_STEPS} steps)")
 print(f"  Output : {OUTPUT_NC}")
 print("=" * 66)
 
-grid = OceanGrid.create(
-    lon_bounds=LON, lat_bounds=LAT,
-    depth_levels=depth_levels,
-    Nx=NX, Ny=NY,
-)
+print("\nLoading ORAS5 initial conditions ...", flush=True)
+t0 = _time.time()
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    raw = read_oras5(ORAS5_IC, time_index=0)
+
+# Land mask + bathymetry from ORAS5; closed east/west walls
+grid = oras5_grid(raw, LON, LAT, depth_levels, NX, NY, periodic_x=False)
+# Horizontal eddy viscosity from the Munk criterion for this grid
+NU_H = munk_viscosity(grid)
+print(f"  nu_h = {NU_H:.3g} m2/s (Munk criterion)")
 mask_np = np.array(grid.mask_c)
 wet     = mask_np > 0
 n_wet   = int(wet.sum())
@@ -105,11 +112,8 @@ print(f"  Wet cells: {n_wet}/{n_total}  ({100*n_wet/n_total:.1f}%)")
 # ---------------------------------------------------------------------------
 # Initial state: oras5_cold
 # ---------------------------------------------------------------------------
-print("\nLoading ORAS5 initial conditions ...", flush=True)
-t0 = _time.time()
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
-    raw        = read_oras5(ORAS5_IC, time_index=0)
     full_state = regrid_to_model(raw, grid)
 print(f"  done in {_time.time()-t0:.1f} s")
 
@@ -157,7 +161,7 @@ def _make_forcing(n_steps: int) -> SurfaceForcing:
     )
 
 
-params  = ModelParams(dt=DT)
+params  = ModelParams(nu_h=NU_H, dt=DT)
 run_jit = jax.jit(run, static_argnames=("n_steps", "save_history"))
 
 # ---------------------------------------------------------------------------
@@ -169,6 +173,7 @@ def _create_nc(path: str) -> nc_lib.Dataset:
     ds.domain      = f"lon={LON} lat={LAT} depth={DEPTH_MAX}m"
     ds.grid        = f"{NX}x{NY}x{NZ}"
     ds.dt          = DT
+    ds.nu_h        = NU_H
     ds.n_days      = N_DAYS
     ds.createDimension("time", None)
     ds.createDimension("x",    NX)

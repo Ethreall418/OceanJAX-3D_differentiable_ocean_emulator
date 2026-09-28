@@ -39,7 +39,8 @@ import jax
 import jax.numpy as jnp
 from OceanJAX.grid import OceanGrid
 from OceanJAX.state import ModelParams, create_from_arrays
-from OceanJAX.data.oras5 import read_oras5, regrid_to_model
+from OceanJAX.data.oras5 import read_oras5, regrid_to_model, oras5_grid
+from OceanJAX.Physics.mixing import munk_viscosity
 from OceanJAX.timeStepping import run
 
 # ---------------------------------------------------------------------------
@@ -61,19 +62,23 @@ STEPS_PER_DAY = int(86400 / DT)
 dz           = DEPTH_MAX / NZ
 depth_levels = (np.arange(NZ) + 0.5) * dz
 
-grid = OceanGrid.create(
-    lon_bounds=LON, lat_bounds=LAT,
-    depth_levels=depth_levels,
-    Nx=NX, Ny=NY,
-)
+print("Loading ORAS5 initial conditions ...", flush=True)
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    raw = read_oras5(ORAS5_IC, time_index=0)
+
+# Land mask + bathymetry from ORAS5; closed east/west walls
+grid = oras5_grid(raw, LON, LAT, depth_levels, NX, NY, periodic_x=False)
+# Horizontal eddy viscosity from the Munk criterion for this grid
+NU_H = munk_viscosity(grid)
+print(f"  nu_h = {NU_H:.3g} m2/s (Munk criterion)")
+print(f"  wet columns: {int(np.asarray(grid.mask_c)[:, :, 0].sum())}/{NX*NY}")
 
 # ---------------------------------------------------------------------------
 # Initial state: oras5_cold
 # ---------------------------------------------------------------------------
-print("Loading ORAS5 initial conditions ...", flush=True)
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
-    raw        = read_oras5(ORAS5_IC, time_index=0)
     full_state = regrid_to_model(raw, grid)
 
 zeros3 = jnp.zeros((NX, NY, NZ), dtype=jnp.float32)
@@ -92,7 +97,7 @@ print(f"  S_wet=[{S0_np[wet].min():.2f}, {S0_np[wet].max():.2f}] psu")
 print(f"  SST_mean_0 = {SST0:.3f} °C")
 print("  Forcing: NONE")
 
-params  = ModelParams(dt=DT)
+params  = ModelParams(nu_h=NU_H, dt=DT)
 run_jit = jax.jit(run, static_argnames=("n_steps", "save_history"))
 
 # ---------------------------------------------------------------------------

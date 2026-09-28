@@ -957,6 +957,141 @@ def load_oras5(
 
 
 # ---------------------------------------------------------------------------
+# Public: oras5_bathymetry
+# ---------------------------------------------------------------------------
+
+def _face_depths(centres: np.ndarray) -> np.ndarray:
+    """
+    Cell-face depths (N+1,) from ascending cell-centre depths (N,), using the
+    same construction as ``OceanGrid.create``: surface at 0, midpoints
+    between centres, and a bottom face half a cell below the last centre.
+    """
+    n = len(centres)
+    faces = np.empty(n + 1, dtype=np.float64)
+    faces[0] = 0.0
+    faces[1:n] = 0.5 * (centres[:-1] + centres[1:])
+    faces[n] = centres[-1] + 0.5 * (centres[-1] - faces[n - 1])
+    return faces
+
+
+def _cell_edges(centres: np.ndarray, upper_faces: np.ndarray) -> np.ndarray:
+    """
+    Cell edges (N+1,) from centres and the upper (east / north) face of
+    each cell, as stored on OceanGrid (lon_c + lon_u, or lat_c + lat_v).
+    """
+    lower0 = 2.0 * centres[0] - upper_faces[0]
+    return np.concatenate([[lower0], upper_faces])
+
+
+def oras5_bathymetry(
+    raw:  dict[str, Optional[np.ndarray]],
+    grid: OceanGrid,
+) -> np.ndarray:
+    """
+    Model bathymetry H (Nx, Ny) [m] derived from the ORAS5 land/sea mask.
+
+    ORAS5 marks land and sub-bottom cells as NaN.  For every source column
+    the water depth is taken as the bottom face of its deepest wet level
+    (counting only levels that are wet contiguously from the surface), and
+    0 for land.  Each model column then receives the **median** of the
+    source depths that fall inside its horizontal cell, i.e. a majority
+    vote: a model cell that is more than half land becomes land (H = 0).
+    Model cells that contain no source point (target finer than ORAS5)
+    fall back to the nearest source column.
+
+    Only ``grid.lon_c/lon_u/lat_c/lat_v`` are used, so a flat-bottom grid
+    built with the same horizontal layout can be passed in::
+
+        raw       = read_oras5(path)
+        grid_flat = OceanGrid.create(LON, LAT, depth_levels, Nx, Ny)
+        H         = oras5_bathymetry(raw, grid_flat)
+        grid      = OceanGrid.create(LON, LAT, depth_levels, Nx, Ny,
+                                     bathymetry=H, periodic_x=False)
+
+    A model cell is then wet where its top face lies above H, so H values
+    deeper than the model's bottom simply give a full-depth column.
+
+    Parameters
+    ----------
+    raw  : dict returned by ``read_oras5()`` (uses ``T``, ``depth``,
+           ``lon``, ``lat``).  Regular and curvilinear grids are supported.
+    grid : target OceanGrid (horizontal layout only).
+
+    Returns
+    -------
+    H : (Nx, Ny) float64 water depth [m]; 0 on land columns.
+    """
+    T     = raw["T"]                               # (Nz_src, Ny_src, Nx_src)
+    depth = np.asarray(raw["depth"], dtype=np.float64)
+
+    # --- source water depth per column -----------------------------------
+    wet_contig = np.cumprod(~np.isnan(T), axis=0)  # 1 while wet from surface
+    n_wet      = wet_contig.sum(axis=0)            # (Ny_src, Nx_src)
+    src_H      = np.where(n_wet > 0, _face_depths(depth)[n_wet], 0.0)
+
+    src_lon, src_lat = raw["lon"], raw["lat"]
+    if src_lon.ndim == 1:
+        src_lat, src_lon = np.meshgrid(src_lat, src_lon, indexing="ij")
+    src_lon, src_lat, src_H = src_lon.ravel(), src_lat.ravel(), src_H.ravel()
+
+    # --- target cell edges, in the source longitude convention -------------
+    lon_c = np.asarray(grid.lon_c, dtype=np.float64)
+    lat_c = np.asarray(grid.lat_c, dtype=np.float64)
+    lon_edges = _unify_lon(
+        src_lon, _cell_edges(lon_c, np.asarray(grid.lon_u, dtype=np.float64))
+    )
+    lat_edges = _cell_edges(lat_c, np.asarray(grid.lat_v, dtype=np.float64))
+    lon_c = _unify_lon(src_lon, lon_c)
+    Nx, Ny = len(lon_c), len(lat_c)
+
+    # --- bin source columns into model cells, take the median --------------
+    ix = np.searchsorted(lon_edges, src_lon, side="right") - 1
+    iy = np.searchsorted(lat_edges, src_lat, side="right") - 1
+    inside = (ix >= 0) & (ix < Nx) & (iy >= 0) & (iy < Ny) & np.isfinite(src_H)
+
+    H      = np.full((Nx, Ny), np.nan, dtype=np.float64)
+    cell   = ix[inside] * Ny + iy[inside]
+    vals   = src_H[inside]
+    order  = np.argsort(cell, kind="stable")
+    cell, vals = cell[order], vals[order]
+    ids, starts = np.unique(cell, return_index=True)
+    for cid, chunk in zip(ids, np.split(vals, starts[1:])):
+        H[cid // Ny, cid % Ny] = np.median(chunk)
+
+    # --- empty cells: nearest source column --------------------------------
+    empty = np.isnan(H)
+    if np.any(empty):
+        nn = NearestNDInterpolator(np.stack([src_lat, src_lon], axis=-1), src_H)
+        lat2d, lon2d = np.meshgrid(lat_c, lon_c)   # (Nx, Ny)
+        H[empty] = nn(np.stack([lat2d[empty], lon2d[empty]], axis=-1))
+
+    return H
+
+
+def oras5_grid(
+    raw:          dict[str, Optional[np.ndarray]],
+    lon_bounds:   tuple,
+    lat_bounds:   tuple,
+    depth_levels: np.ndarray,
+    Nx:           int,
+    Ny:           int,
+    periodic_x:   bool = False,
+) -> OceanGrid:
+    """
+    OceanGrid whose land mask and bathymetry come from ORAS5.
+
+    Convenience wrapper around ``oras5_bathymetry``: builds a flat-bottom
+    grid for the horizontal layout, derives H from ``raw`` and rebuilds the
+    grid with it.  ``periodic_x`` defaults to False (closed east/west walls)
+    because ORAS5-initialised runs are regional.
+    """
+    flat = OceanGrid.create(lon_bounds, lat_bounds, depth_levels, Nx, Ny)
+    H    = oras5_bathymetry(raw, flat)
+    return OceanGrid.create(lon_bounds, lat_bounds, depth_levels, Nx, Ny,
+                            bathymetry=H, periodic_x=periodic_x)
+
+
+# ---------------------------------------------------------------------------
 # Public: read_oras5_forcing
 # ---------------------------------------------------------------------------
 

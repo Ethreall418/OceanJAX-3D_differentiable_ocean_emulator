@@ -50,7 +50,9 @@ import jax.numpy as jnp
 import equinox as eqx
 from OceanJAX.grid import OceanGrid
 from OceanJAX.state import ModelParams
-from OceanJAX.data.oras5 import read_oras5, regrid_to_model, read_oras5_forcing, regrid_forcing
+from OceanJAX.data.oras5 import (read_oras5, regrid_to_model, read_oras5_forcing,
+                                  regrid_forcing, oras5_grid)
+from OceanJAX.Physics.mixing import munk_viscosity
 from OceanJAX.timeStepping import run, SurfaceForcing
 
 # ---------------------------------------------------------------------------
@@ -78,16 +80,16 @@ C_BT = np.sqrt(G * H)   # barotropic wave speed ≈ 70 m/s
 # Build grid and base initial state (shared across all dt)
 # ---------------------------------------------------------------------------
 print("Loading ORAS5 ...", flush=True)
-grid = OceanGrid.create(
-    lon_bounds=LON, lat_bounds=LAT,
-    depth_levels=DEPTH_LEVELS,
-    Nx=NX, Ny=NY,
-)
-
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
-    raw   = read_oras5(ORAS5_PATH, time_index=0)
+    raw    = read_oras5(ORAS5_PATH, time_index=0)
+    # Land mask + bathymetry from ORAS5; closed east/west walls
+    grid   = oras5_grid(raw, LON, LAT, DEPTH_LEVELS, NX, NY, periodic_x=False)
+    # Horizontal eddy viscosity from the Munk criterion for this grid
+    NU_H = munk_viscosity(grid)
+    print(f"  nu_h = {NU_H:.3g} m2/s (Munk criterion)")
     state0 = regrid_to_model(raw, grid)
+wet = np.asarray(grid.mask_c) > 0
 
 # oras5_cold: zero velocities and eta
 zeros3 = jnp.zeros((NX, NY, len(DEPTH_LEVELS)), dtype=jnp.float32)
@@ -124,7 +126,7 @@ for dt in DT_LIST:
     total_steps   = N_DAYS * steps_per_day
     cfl_est       = C_BT * dt / dx_min
 
-    params = ModelParams(dt=float(dt))
+    params = ModelParams(nu_h=NU_H, dt=float(dt))
 
     # Tile forcing to total_steps
     def _tile(arr, n):
@@ -150,15 +152,16 @@ for dt in DT_LIST:
 
         finite  = (np.all(np.isfinite(T_arr)) and np.all(np.isfinite(S_arr))
                    and np.all(np.isfinite(eta_arr)))
-        T_ok    = (T_arr.min() > 0.0  and T_arr.max() < 50.0)
-        S_ok    = (S_arr[S_arr > 0].min() > 30.0 and S_arr.max() < 42.0)
+        # Ranges over wet cells only (land cells hold zeros)
+        T_ok    = (T_arr[wet].min() > 0.0  and T_arr[wet].max() < 50.0)
+        S_ok    = (S_arr[wet].min() > 30.0 and S_arr[wet].max() < 42.0)
         stable  = finite and T_ok and S_ok
         verdict = "STABLE" if stable else "UNSTABLE"
 
         rec = dict(
             dt=dt, cfl=cfl_est, steps=total_steps,
-            T_min=T_arr.min(), T_max=T_arr.max(),
-            S_min=float(S_arr[S_arr > 0].min()), S_max=S_arr.max(),
+            T_min=T_arr[wet].min(), T_max=T_arr[wet].max(),
+            S_min=float(S_arr[wet].min()), S_max=S_arr[wet].max(),
             eta_max=float(np.max(np.abs(eta_arr))),
             finite=finite, stable=stable, wall=wall,
         )

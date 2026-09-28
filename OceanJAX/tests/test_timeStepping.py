@@ -23,8 +23,13 @@ Five groups of properties are verified:
        The leapfrog multiplier is dt at step_count == 0 and 2*dt afterwards.
 
   5. eta / w kinematic surface BC
-       The surface face of w (k=0) must equal deta/dt so that the
-       continuity equation is satisfied at the free surface.
+       The surface face of w (k=0) must equal -deta/dt (w positive
+       downward) so that continuity is satisfied at the free surface.
+
+  6. Tracer consistency / conservation and closed zonal walls
+       Uniform tracers stay uniform under divergent flow; advection's only
+       net source is the surface kinematic flux; periodic_x=False closes
+       the east/west boundaries for every equation.
 
 Running
 -------
@@ -291,6 +296,13 @@ class TestBootstrap:
     _PREV  = 0.1    # °C s-1 injected as T_tend_prev
     _PREV2 = 0.05   # °C s-1 injected as T_tend_prev2
 
+    @pytest.fixture
+    def ab_params(self):
+        """These fake tendencies push T far below freezing (10 → -35 °C);
+        the freezing-point limit is switched off so that only the AB
+        coefficients are tested."""
+        return ModelParams(limit_freezing=False)
+
     def _state_with_history(self, rest_state, sc: int):
         """Return rest_state with fake tendency history and the given step_count."""
         fake_prev  = jnp.full_like(rest_state.T, self._PREV)
@@ -302,20 +314,20 @@ class TestBootstrap:
         )
         return s
 
-    def test_ab1_ignores_prev_tendencies(self, flat_grid, default_params, rest_state):
+    def test_ab1_ignores_prev_tendencies(self, flat_grid, ab_params, rest_state):
         """step_count=0 must use AB1: T_new = T (prev history ignored)."""
         s = self._state_with_history(rest_state, sc=0)
-        new = step(s, flat_grid, default_params, forcing=None)
+        new = step(s, flat_grid, ab_params, forcing=None)
         # G_T = 0 for rest state → AB1 gives T_new = T; AB2/AB3 would change T
         assert jnp.allclose(new.T, rest_state.T, atol=1e-6), (
             "AB1 at step_count=0 must ignore T_tend_prev; T should be unchanged"
         )
 
-    def test_ab2_uses_prev_tendency(self, flat_grid, default_params, rest_state):
+    def test_ab2_uses_prev_tendency(self, flat_grid, ab_params, rest_state):
         """step_count=1 must use AB2: T_new = T - dt/2 * T_tend_prev."""
-        dt = default_params.dt
+        dt = ab_params.dt
         s  = self._state_with_history(rest_state, sc=1)
-        new = step(s, flat_grid, default_params, forcing=None)
+        new = step(s, flat_grid, ab_params, forcing=None)
         # G_T = 0, so AB2 → T_new = T + dt * (-1/2) * T_tend_prev
         expected_delta = -0.5 * dt * self._PREV
         actual_delta   = float(jnp.mean(new.T - rest_state.T))
@@ -323,12 +335,12 @@ class TestBootstrap:
             f"AB2 delta T = {actual_delta:.6f}, expected {expected_delta:.6f}"
         )
 
-    def test_ab3_uses_both_prev_tendencies(self, flat_grid, default_params, rest_state):
+    def test_ab3_uses_both_prev_tendencies(self, flat_grid, ab_params, rest_state):
         """step_count=2 must use AB3 with coefficients (23/12, -16/12, 5/12)."""
-        dt = default_params.dt
-        ab3_0, ab3_1, ab3_2 = default_params.ab3_coeffs   # (23/12, -16/12, 5/12)
+        dt = ab_params.dt
+        ab3_0, ab3_1, ab3_2 = ab_params.ab3_coeffs   # (23/12, -16/12, 5/12)
         s   = self._state_with_history(rest_state, sc=2)
-        new = step(s, flat_grid, default_params, forcing=None)
+        new = step(s, flat_grid, ab_params, forcing=None)
         # G_T = 0 → T_new = T + dt * (ab3_1 * T_tend_prev + ab3_2 * T_tend_prev2)
         expected_delta = dt * (ab3_1 * self._PREV + ab3_2 * self._PREV2)
         actual_delta   = float(jnp.mean(new.T - rest_state.T))
@@ -336,7 +348,7 @@ class TestBootstrap:
             f"AB3 delta T = {actual_delta:.6f}, expected {expected_delta:.6f}"
         )
 
-    def test_leapfrog_first_step_uses_single_dt(self, flat_grid, default_params, rest_state):
+    def test_leapfrog_first_step_uses_single_dt(self, flat_grid, ab_params, rest_state):
         """
         The leapfrog multiplier is ``dt`` at step_count=0 and ``2*dt`` at
         step_count=1.  With a resting ocean and wind stress the momentum
@@ -352,13 +364,13 @@ class TestBootstrap:
 
         # step_count=0 → leapfrog_dt = dt
         s0 = rest_state                                                    # step_count=0
-        new0 = step(s0, flat_grid, default_params, forcing=forcing)
+        new0 = step(s0, flat_grid, ab_params, forcing=forcing)
 
         # step_count=1 but otherwise identical input (same u, u_prev, T, S …)
         s1 = eqx.tree_at(
             lambda s: s.step_count, rest_state, jnp.array(1, dtype=jnp.int32)
         )
-        new1 = step(s1, flat_grid, default_params, forcing=forcing)
+        new1 = step(s1, flat_grid, ab_params, forcing=forcing)
 
         # After implicit vertical viscosity the factor-of-2 relationship is
         # preserved exactly (linear operator scales with the input).
@@ -376,10 +388,10 @@ class TestBootstrap:
 
 class TestEtaWConsistency:
     """
-    After every step, the surface face of w must equal deta/dt = (eta_new -
-    eta_old) / dt.  This enforces the kinematic free-surface boundary
-    condition and ensures that the free-surface update and the continuity
-    diagnosis are consistent.
+    After every step, the surface face of w must equal -deta/dt (w is
+    positive downward, so a rising surface means upward, negative w).
+    This enforces the kinematic free-surface boundary condition and ensures
+    that the free-surface update and the continuity diagnosis are consistent.
     """
 
     def test_w_surface_equals_deta_dt_rest(self, flat_grid, default_params, rest_state):
@@ -392,7 +404,8 @@ class TestEtaWConsistency:
         """
         With spatially varying wind stress the horizontal velocity divergence is
         non-zero, so eta and w[:, :, 0] are both non-trivial.  Their relationship
-        w[:, :, 0] = (eta_new - eta_old) / dt must hold exactly.
+        w[:, :, 0] = -(eta_new - eta_old) / dt must hold exactly (at step 0 the
+        eta update is a 1*dt Forward-Euler step with the same u_filt).
         """
         # Linearly varying tau_x in x → zonal gradient → divergence ≠ 0
         tau_x = (jnp.arange(flat_grid.Nx, dtype=jnp.float32)[:, None]
@@ -408,13 +421,16 @@ class TestEtaWConsistency:
         dt  = default_params.dt
 
         # For a full-ocean flat grid, mask_c[:, :, 0] = mask_w[:, :, 0] = 1 everywhere.
-        # The kinematic BC then reads: w_new[:, :, 0] = (eta_new - eta_old) / dt
-        deta_dt_from_eta = (new.eta - rest_state.eta) / dt
+        # The kinematic BC then reads: w_new[:, :, 0] = -(eta_new - eta_old) / dt
+        deta_dt_from_eta = np.array((new.eta - rest_state.eta) / dt)
+        w0    = np.array(new.w[:, :, 0])
+        scale = np.abs(deta_dt_from_eta).max()
+        assert scale > 0.0
+        # Relative tolerance: |w| here is O(1e-9) m/s, so any absolute
+        # tolerance of practical size would accept either sign.
         np.testing.assert_allclose(
-            np.array(new.w[:, :, 0]),
-            np.array(deta_dt_from_eta),
-            atol=1e-6,
-            err_msg="w[:, :, 0] must equal (eta_new - eta_old) / dt"
+            w0 / scale, -deta_dt_from_eta / scale, atol=1e-4,
+            err_msg="w[:, :, 0] must equal -(eta_new - eta_old) / dt"
         )
 
     def test_w_surface_nonzero_after_divergent_forcing(self, flat_grid, default_params, rest_state):
@@ -431,3 +447,124 @@ class TestEtaWConsistency:
         assert not jnp.allclose(new.w[:, :, 0], 0.0, atol=1e-10), (
             "Spatially varying wind stress should produce non-zero w[0]"
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. Tracer consistency / conservation and closed zonal walls
+# ---------------------------------------------------------------------------
+
+def _basin_grid(periodic_x: bool = False) -> OceanGrid:
+    """6×5×4 grid with stepped bathymetry, one land column and a shelf."""
+    z_levels = np.array([5.0, 20.0, 50.0, 100.0], dtype=np.float64)
+    H = np.full((6, 5), 200.0)
+    H[2, 2] = 30.0     # two wet levels
+    H[4, 1] = 10.0     # one wet level
+    H[0, 4] = 0.0      # land column
+    return OceanGrid.create(
+        lon_bounds=(0.0, 30.0), lat_bounds=(10.0, 35.0),
+        depth_levels=z_levels, Nx=6, Ny=5,
+        bathymetry=H, periodic_x=periodic_x,
+    )
+
+
+def _divergent_state(grid: OceanGrid, S_field, seed: int = 0):
+    """Random O(0.1 m/s) velocities: strongly divergent in every layer."""
+    import jax
+    from OceanJAX.state import create_from_arrays
+    key = jax.random.PRNGKey(seed)
+    shape = (grid.Nx, grid.Ny, grid.Nz)
+    u = 0.1 * jax.random.normal(key, shape)
+    v = 0.1 * jax.random.normal(jax.random.fold_in(key, 1), shape)
+    T = jnp.full(shape, 15.0)
+    return create_from_arrays(grid, u=u, v=v, T=T, S=S_field,
+                              eta=jnp.zeros((grid.Nx, grid.Ny)))
+
+
+class TestTracerConservation:
+    """
+    compute_w integrates upward from the seafloor and tracers are advected
+    with the w diagnosed from the same u_filt/v_filt, so every cell is
+    exactly non-divergent.  Consequences checked here:
+
+      - a uniform tracer stays uniform under strongly divergent flow, in
+        every layer including the bottom one (before the fix, the column
+        divergence was dumped into the bottom cell as a spurious source);
+      - advection changes total tracer content only through the linear
+        free-surface kinematic flux w[0]*C[0] at the sea surface.
+    """
+
+    N_STEPS = 100
+
+    def test_uniform_tracer_stays_uniform(self):
+        grid   = _basin_grid()
+        params = ModelParams(dt=300.0)
+        S0     = jnp.full((grid.Nx, grid.Ny, grid.Nz), 35.0)
+        state  = _divergent_state(grid, S0)
+        final, _ = run(state, grid, params, self.N_STEPS)
+
+        wet = np.asarray(grid.mask_c) > 0
+        S   = np.asarray(final.S)
+        assert np.abs(np.asarray(final.eta)).max() > 1e-3, "flow must move eta"
+        dev = np.abs(S[wet] - 35.0).max()
+        assert dev < 1e-3, f"uniform S drifted by {dev:.3e} psu"
+
+    def test_advective_budget_is_surface_flux_only(self):
+        """Flux-form advection with the bottom-up w: the only net source of
+        tracer content is the free-surface kinematic flux, i.e.
+        sum(adv * V) == sum(w[0] * C[0] * A) exactly, for any tracer field."""
+        import jax
+        from OceanJAX.Physics.dynamics import compute_w
+        from OceanJAX.Physics.tracers import upwind_advection
+        grid  = _basin_grid()
+        state = _divergent_state(grid, jnp.full((grid.Nx, grid.Ny, grid.Nz), 35.0))
+        C     = (35.0 + jax.random.normal(jax.random.PRNGKey(9),
+                                          (grid.Nx, grid.Ny, grid.Nz))) * grid.mask_c
+        w     = compute_w(state.u, state.v, grid)
+        adv   = np.asarray(upwind_advection(C, state.u, state.v, w, grid), np.float64)
+
+        V, A  = np.asarray(grid.volume_c, np.float64), np.asarray(grid.area_c, np.float64)
+        total = (adv * V).sum()
+        surf  = (np.asarray(w, np.float64)[:, :, 0] * np.asarray(C, np.float64)[:, :, 0]
+                 * A * np.asarray(grid.mask_w)[:, :, 0]).sum()
+        scale = (np.abs(adv) * V).sum()
+        assert abs(total - surf) / scale < 1e-5, (total, surf, scale)
+
+
+class TestClosedZonalWalls:
+    """periodic_x=False closes the east/west boundaries for every equation."""
+
+    def test_mask_u_closed_at_east_face(self):
+        assert np.all(np.asarray(_basin_grid(False).mask_u)[-1] == 0.0)
+        assert np.any(np.asarray(_basin_grid(True).mask_u)[-1] == 1.0)
+
+    def test_no_flow_through_wall_and_volume_conserved(self):
+        grid   = _basin_grid(False)
+        params = ModelParams(dt=300.0)
+        S0     = jnp.full((grid.Nx, grid.Ny, grid.Nz), 35.0)
+        state  = _divergent_state(grid, S0, seed=2)
+        final, _ = run(state, grid, params, 50)
+
+        assert np.all(np.asarray(final.u)[-1] == 0.0)
+        A, m0 = np.asarray(grid.area_c), np.asarray(grid.mask_c)[:, :, 0]
+        eta   = np.asarray(final.eta)
+        vol_err = abs((eta * A * m0).sum()) / (np.abs(eta) * A * m0).sum()
+        assert vol_err < 1e-4, f"net volume change {vol_err:.3e} of |eta| volume"
+
+    @pytest.mark.parametrize("periodic", [False, True])
+    def test_v_viscosity_does_not_wrap(self, periodic):
+        """v-point viscosity is gated by mask_v, so the wall must be closed
+        explicitly: v confined to i=0 must not leak to i=Nx-1 in one step."""
+        z_levels = np.array([5.0, 20.0, 50.0, 100.0])
+        grid = OceanGrid.create((0.0, 30.0), (10.0, 35.0), z_levels, 6, 5,
+                                periodic_x=periodic)
+        params = ModelParams(dt=300.0)
+        state  = create_rest_state(grid, T_background=params.T_ref,
+                                   S_background=params.S_ref)
+        v0 = jnp.zeros((grid.Nx, grid.Ny, grid.Nz)).at[0, 1:3, :].set(0.2) * grid.mask_v
+        state = eqx.tree_at(lambda s: (s.v, s.v_prev), state, (v0, v0))
+        new = step(state, grid, params)
+        leaked = np.abs(np.asarray(new.v)[-1]).max()
+        if periodic:
+            assert leaked > 0.0
+        else:
+            assert leaked == 0.0, f"v leaked through the wall: {leaked:.3e}"

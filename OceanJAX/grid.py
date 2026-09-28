@@ -87,13 +87,19 @@ class OceanGrid(eqx.Module):
     mask_v: jnp.ndarray   # (Nx, Ny, Nz)
     mask_w: jnp.ndarray       # (Nx, Ny, Nz+1)
     mask_w_adv: jnp.ndarray   # (Nx, Ny, Nz+1)  same as mask_w but k=0 always 0
-    #   The surface face (k=0) is open in mask_w so that kinematic signals
-    #   (w = deta/dt) can propagate, but is closed in mask_w_adv so that
-    #   tracer advection cannot cross the sea surface.  All surface tracer
-    #   exchange must go through the explicit surface-forcing tendencies.
+    #   The surface face (k=0) is open in mask_w: it carries the linear
+    #   free-surface kinematic flux w[0] = -deta/dt, used both by w and by
+    #   tracer advection.  mask_w_adv closes it for implicit vertical
+    #   diffusion, so no diffusive flux crosses the sea surface; air-sea
+    #   exchange goes only through the explicit surface-forcing tendencies.
 
     # ---- bathymetry -------------------------------------------------------
     H: jnp.ndarray        # (Nx, Ny)  total water column depth [m]
+
+    # ---- zonal boundary type (compile-time constant) ----------------------
+    # True : x is periodic (east face of i=Nx-1 connects to i=0).
+    # False: closed east/west walls (mask_u[Nx-1] = 0), for regional domains.
+    periodic_x: bool = eqx.field(static=True, default=True)
 
     # ------------------------------------------------------------------
     # Factory method
@@ -108,6 +114,7 @@ class OceanGrid(eqx.Module):
         bathymetry: Optional[np.ndarray] = None,
         lon_spacing: Optional[np.ndarray] = None,
         lat_spacing: Optional[np.ndarray] = None,
+        periodic_x: bool = True,
     ) -> "OceanGrid":
         """
         Build an OceanGrid.
@@ -128,6 +135,14 @@ class OceanGrid(eqx.Module):
                       total span.
         lat_spacing : optional weight array (length Ny) for variable resolution
                       in y.
+        periodic_x  : True (default) for a zonally periodic domain.  False
+                      closes the east and west boundaries with solid walls
+                      by zeroing mask_u on the east face of i = Nx-1 (the
+                      face that would otherwise wrap around to i = 0).
+                      Zonal fluxes at tracer and u points are gated by
+                      mask_u, so this closes the boundary for the free
+                      surface, advection, diffusion and u; the v-point
+                      viscosity flux checks ``periodic_x`` explicitly.
         """
         lon_min, lon_max = lon_bounds
         lat_min, lat_max = lat_bounds
@@ -217,6 +232,8 @@ class OceanGrid(eqx.Module):
 
         # u-mask: ocean if both i and i+1 tracer cells are ocean (periodic in x)
         mask_u_np = mask_c_np * np.roll(mask_c_np, -1, axis=0)
+        if not periodic_x:
+            mask_u_np[-1, :, :] = 0.0  # east/west walls: no wrap-around face
         # v-mask: ocean if both j and j+1 tracer cells are ocean
         mask_v_np = mask_c_np * np.roll(mask_c_np, -1, axis=1)
         mask_v_np[:, -1, :] = 0.0  # no flow at northern boundary
@@ -259,4 +276,5 @@ class OceanGrid(eqx.Module):
             mask_w    =jnp.array(mask_w_np,     dtype=jnp.float32),
             mask_w_adv=jnp.array(mask_w_adv_np, dtype=jnp.float32),
             H=jnp.array(H_np, dtype=jnp.float32),
+            periodic_x=periodic_x,
         )

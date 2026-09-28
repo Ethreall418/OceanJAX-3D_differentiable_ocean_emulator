@@ -30,6 +30,12 @@ DEPTH_MAX = 500.0             # m
 NX, NY, NZ = 20, 15, 10      # grid cells in x, y, z
 DT        = 300.0             # time step [s]
 
+# --- Horizontal viscosity -----------------------------------------------------
+#   "munk" — nu_h from the Munk criterion for this grid (resolves the western
+#            boundary layer; scales as dx^3, e.g. ~1.7e5 m2/s at 1.75°)
+#   float  — fixed nu_h [m2 s-1]
+NU_H = "munk"
+
 # --- Initial conditions -------------------------------------------------------
 #   "rest"       — uniform T_BG / S_BG, zero velocity
 #   "oras5_cold" — T/S from ORAS5, u = v = eta = 0  (recommended: most stable)
@@ -44,29 +50,33 @@ N_DAYS = 30                   # total simulation length in days
 
 # --- Surface forcing ----------------------------------------------------------
 #
-# FORCING_SOURCE controls where forcing data comes from:
+# FORCING_DIR: folder with ORAS5 monthly 2-D forcing files
+#   (<var>_control_monthly_highres_2D_<YYYYMM>_OPER_v0.1.nc, var in sohefldo,
+#   sowaflup, sozotaux, sometauy), relative to this script or absolute.
+#   None — use only the constant values below (HEAT_FLUX etc.).
 #
-#   None         — use only the constant values below (HEAT_FLUX etc.)
-#   "<path>"     — read from a NetCDF file (ORAS5 flux file, ERA5, etc.)
-#                  Fields listed in FORCING_FIELDS are read from the file;
-#                  the rest fall back to the constant values below.
+#   The month in effect follows the model calendar starting at START_DATE.
+#   Every complete month in the folder is used; a missing month falls back to
+#   the same calendar month of another year, then to the nearest month (with
+#   only January on disk the run is forced by perpetual January).
 #
-# FORCING_FIELDS: which fields to read from the file.  Any subset of:
+# FORCING_INTERP:
+#   "linear"  — monthly means at mid-month, linearly interpolated (smooth)
+#   "monthly" — each month's mean held constant, switching on the 1st
+#
+# FORCING_FIELDS: which fields to take from the files.  Any subset of:
 #   {"heat_flux", "fw_flux", "tau_x", "tau_y"}
 #
-# Constant fallback values (used when FORCING_SOURCE is None, or for fields
-# not listed in FORCING_FIELDS, or absent from the file):
+# Constant fallback values (used when FORCING_DIR is None, or for fields
+# not listed in FORCING_FIELDS):
 #   HEAT_FLUX  [W m-2]  net downward heat flux   (positive = warming ocean)
 #   FW_FLUX    [m s-1]  net E-P freshwater flux  (positive = net evaporation)
 #   TAU_X      [N m-2]  zonal wind stress        (positive = eastward)
 #   TAU_Y      [N m-2]  meridional wind stress   (positive = northward)
 
-FORCING_SOURCE = [                                     # list of per-field ORAS5 files
-    "OceanJAX/data/data_oras5/sohefldo_control_monthly_highres_2D_202601_OPER_v0.1.nc",
-    "OceanJAX/data/data_oras5/sowaflup_control_monthly_highres_2D_202601_OPER_v0.1.nc",
-    "OceanJAX/data/data_oras5/sozotaux_control_monthly_highres_2D_202601_OPER_v0.1.nc",
-    "OceanJAX/data/data_oras5/sometauy_control_monthly_highres_2D_202601_OPER_v0.1.nc",
-]
+FORCING_DIR    = "OceanJAX/data/data_oras5"
+START_DATE     = "2026-01-01"      # calendar date of model time 0
+FORCING_INTERP = "linear"
 FORCING_FIELDS = {"heat_flux", "fw_flux", "tau_x", "tau_y"}
 HEAT_FLUX = 0.0
 FW_FLUX   = 0.0
@@ -113,28 +123,12 @@ _ORAS5_FILE = _SCRIPT_DIR / ORAS5_PATH
 # Grid & state builders
 # ---------------------------------------------------------------------------
 
-def _build_grid():
-    from OceanJAX.grid import OceanGrid
-    dz           = DEPTH_MAX / NZ
-    depth_levels = (np.arange(NZ) + 0.5) * dz
-    return OceanGrid.create(
-        lon_bounds   = LON,
-        lat_bounds   = LAT,
-        depth_levels = depth_levels,
-        Nx           = NX,
-        Ny           = NY,
-    )
-
-
-def _build_state(grid):
-    import warnings
-    from OceanJAX.state import create_rest_state, create_from_arrays
-    from OceanJAX.data.oras5 import read_oras5, regrid_to_model
+def _read_raw():
+    """Read the ORAS5 slice once (None for INIT_MODE == "rest")."""
+    from OceanJAX.data.oras5 import read_oras5
 
     if INIT_MODE == "rest":
-        print(f"Init: rest  T={T_BG} °C  S={S_BG} psu")
-        return create_rest_state(grid, T_background=T_BG, S_background=S_BG)
-
+        return None
     if not _ORAS5_FILE.exists():
         print(f"ERROR: ORAS5 file not found: {_ORAS5_FILE}", file=sys.stderr)
         sys.exit(1)
@@ -143,6 +137,34 @@ def _build_state(grid):
     t0  = _time.perf_counter()
     raw = read_oras5(_ORAS5_FILE, time_index=ORAS5_TIME_INDEX)
     print(f"  done in {_time.perf_counter() - t0:.1f} s")
+    return raw
+
+
+def _build_grid(raw):
+    """
+    ORAS5 runs: land mask + bathymetry from ORAS5, closed east/west walls.
+    "rest" runs: flat-bottom, zonally periodic ocean.
+    """
+    from OceanJAX.grid import OceanGrid
+    from OceanJAX.data.oras5 import oras5_grid
+    dz           = DEPTH_MAX / NZ
+    depth_levels = (np.arange(NZ) + 0.5) * dz
+    if raw is None:
+        return OceanGrid.create(LON, LAT, depth_levels, NX, NY)
+    grid = oras5_grid(raw, LON, LAT, depth_levels, NX, NY, periodic_x=False)
+    wet_cols = int(np.asarray(grid.mask_c)[:, :, 0].sum())
+    print(f"  ORAS5 land mask: {wet_cols}/{NX * NY} wet columns")
+    return grid
+
+
+def _build_state(grid, raw):
+    import warnings
+    from OceanJAX.state import create_rest_state, create_from_arrays
+    from OceanJAX.data.oras5 import regrid_to_model
+
+    if INIT_MODE == "rest":
+        print(f"Init: rest  T={T_BG} °C  S={S_BG} psu")
+        return create_rest_state(grid, T_background=T_BG, S_background=S_BG)
 
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always")
@@ -201,17 +223,17 @@ def _build_ensemble_states(base_state, grid):
 # Forcing builder
 # ---------------------------------------------------------------------------
 
-def _build_forcing(n_steps: int, grid):
+def _make_forcing_provider(grid):
     """
-    Build a SurfaceForcing for one chunk of n_steps.
+    Return ``provider(t_start, n_steps) -> SurfaceForcing | None`` for one chunk.
 
-    Priority:
-      1. If FORCING_SOURCE is set, read the listed FORCING_FIELDS from that file.
-      2. Any field not in FORCING_FIELDS (or absent from the file) falls back to
-         the corresponding constant (HEAT_FLUX, FW_FLUX, TAU_X, TAU_Y).
-      3. If all four constants are zero and FORCING_SOURCE is None, return None.
+    ORAS5 months are read and regridded once here (MonthlyForcing); each call
+    then only interpolates in time.  Fields not in FORCING_FIELDS use the
+    constants (HEAT_FLUX, FW_FLUX, TAU_X, TAU_Y).  With FORCING_DIR None and
+    all constants zero, the provider returns None (no surface forcing).
     """
     from OceanJAX.timeStepping import SurfaceForcing
+    from OceanJAX.data.monthly_forcing import MonthlyForcing
 
     const = {
         "heat_flux": float(HEAT_FLUX),
@@ -219,30 +241,32 @@ def _build_forcing(n_steps: int, grid):
         "tau_x":     float(TAU_X),
         "tau_y":     float(TAU_Y),
     }
+    if FORCING_DIR is None and not any(const.values()):
+        return lambda t_start, n_steps: None
 
-    if FORCING_SOURCE is None and not any(const.values()):
-        return None
+    monthly = None
+    if FORCING_DIR is not None:
+        forcing_dir = Path(FORCING_DIR)
+        if not forcing_dir.is_absolute():
+            forcing_dir = _SCRIPT_DIR / forcing_dir
+        monthly = MonthlyForcing(forcing_dir, grid, START_DATE,
+                                 interp=FORCING_INTERP, use_fields=FORCING_FIELDS)
+        print(f"  forcing months on disk: "
+              f"{', '.join(f'{y}-{m:02d}' for y, m in monthly.months)}  "
+              f"(interp={FORCING_INTERP}, start={START_DATE})")
 
-    base: dict[str, np.ndarray] = {
-        k: np.full((NX, NY), v, dtype=np.float32) for k, v in const.items()
-    }
+    def provider(t_start: float, n_steps: int):
+        const_fields = {k: jnp.full((n_steps, NX, NY), v, dtype=jnp.float32)
+                        for k, v in const.items()}
+        if monthly is None:
+            return SurfaceForcing(**const_fields)
+        sf = monthly.chunk(t_start, n_steps, DT)
+        return SurfaceForcing(**{
+            k: getattr(sf, k) if k in FORCING_FIELDS else const_fields[k]
+            for k in const
+        })
 
-    if FORCING_SOURCE is not None:
-        from OceanJAX.data.oras5 import read_oras5_forcing, regrid_forcing
-        raw_f   = read_oras5_forcing(FORCING_SOURCE, time_index=0)
-        file_sf = regrid_forcing(raw_f, grid, use_fields=FORCING_FIELDS)
-        for key in ("heat_flux", "fw_flux", "tau_x", "tau_y"):
-            if key in FORCING_FIELDS:
-                base[key] = np.asarray(getattr(file_sf, key))
-
-    # Shape: (n_steps, NX, NY)
-    ones = np.ones((n_steps, 1, 1), dtype=np.float32)
-    return SurfaceForcing(
-        heat_flux = jnp.asarray(base["heat_flux"] * ones),
-        fw_flux   = jnp.asarray(base["fw_flux"]   * ones),
-        tau_x     = jnp.asarray(base["tau_x"]     * ones),
-        tau_y     = jnp.asarray(base["tau_y"]     * ones),
-    )
+    return provider
 
 
 def _broadcast_forcing_to_ensemble(forcing, n_members: int):
@@ -273,6 +297,10 @@ def _create_nc(path: str, grid) -> nc_lib.Dataset:
     ds.fw_flux     = FW_FLUX
     ds.tau_x       = TAU_X
     ds.tau_y       = TAU_Y
+    ds.forcing_dir    = str(FORCING_DIR)
+    ds.start_date     = START_DATE
+    ds.forcing_interp = FORCING_INTERP
+    ds.forcing_fields = ",".join(sorted(FORCING_FIELDS))
     ds.n_ensemble  = N_ENSEMBLE
 
     ds.createDimension("time",   None)
@@ -336,11 +364,14 @@ def _write_snapshot(ds: nc_lib.Dataset, state) -> None:
     ds.sync()
 
 
-def _diag_line(state, sim_day: float, steps_done: int, wall: float) -> bool:
+def _diag_line(state, sim_day: float, steps_done: int, wall: float, grid) -> bool:
     """
     Print one diagnostic line.  Handles both single and ensemble states.
+    Ranges are taken over wet cells only (land cells hold zeros).
     Returns True if any non-finite value is detected.
     """
+    wet  = np.asarray(grid.mask_c) > 0         # (NX, NY, NZ)
+    wet2 = wet[:, :, 0]                        # (NX, NY)
     if N_ENSEMBLE > 1:
         # Ensemble: report mean ± std across members
         T_all   = np.array(state.T)    # (B, NX, NY, NZ)
@@ -349,8 +380,8 @@ def _diag_line(state, sim_day: float, steps_done: int, wall: float) -> bool:
         bad = (not np.all(np.isfinite(T_all)) or
                not np.all(np.isfinite(S_all)) or
                not np.all(np.isfinite(eta_all)))
-        T_mean   = T_all.mean(axis=0);    T_std  = T_all.std(axis=0)
-        eta_mean = eta_all.mean(axis=0);  eta_std = eta_all.std(axis=0)
+        T_mean   = T_all.mean(axis=0)[wet];    T_std   = T_all.std(axis=0)[wet]
+        eta_mean = eta_all.mean(axis=0)[wet2]; eta_std = eta_all.std(axis=0)[wet2]
         print(f"{sim_day:5.1f}  {steps_done:6d}  "
               f"T_mean=[{T_mean.min():.3f},{T_mean.max():.3f}] "
               f"±{T_std.max():.4f}  "
@@ -366,9 +397,9 @@ def _diag_line(state, sim_day: float, steps_done: int, wall: float) -> bool:
                  not np.all(np.isfinite(S_a)) or
                  not np.all(np.isfinite(eta_a)))
         print(f"{sim_day:5.1f}  {steps_done:6d}  "
-              f"{T_a.min():7.3f} {T_a.max():7.3f}  "
-              f"{S_a.min():6.3f} {S_a.max():6.3f}  "
-              f"{eta_a.min():8.4f} {eta_a.max():8.4f}  "
+              f"{T_a[wet].min():7.3f} {T_a[wet].max():7.3f}  "
+              f"{S_a[wet].min():6.3f} {S_a[wet].max():6.3f}  "
+              f"{eta_a[wet2].min():8.4f} {eta_a[wet2].max():8.4f}  "
               f"{'NON-FINITE!' if bad else 'ok':>10}  {wall:5.1f}s",
               flush=True)
     return bad
@@ -398,11 +429,17 @@ def main() -> None:
     print(f"  output    : {OUTPUT_NC}  save_every={SAVE_INTERVAL} steps")
     print("=" * 62)
 
-    grid   = _build_grid()
-    params = ModelParams(dt=DT)
+    from OceanJAX.Physics.mixing import munk_viscosity
+
+    raw    = _read_raw()
+    grid   = _build_grid(raw)
+    nu_h   = munk_viscosity(grid) if NU_H == "munk" else float(NU_H)
+    params = ModelParams(dt=DT, nu_h=nu_h)
+    print(f"  nu_h = {nu_h:.3g} m2/s  ({'Munk criterion' if NU_H == 'munk' else 'fixed'})")
+    forcing_for = _make_forcing_provider(grid)
 
     # Build initial state(s)
-    base_state = _build_state(grid)
+    base_state = _build_state(grid, raw)
     if ensemble:
         state = _build_ensemble_states(base_state, grid)
         print(f"  Ensemble of {N_ENSEMBLE} members created.")
@@ -426,6 +463,7 @@ def main() -> None:
 
     # Open output file and save t=0
     ds = _create_nc(OUTPUT_NC, grid)
+    ds.nu_h = params.nu_h
     _write_snapshot(ds, state)
     print(f"\nOutput: {OUTPUT_NC}  (t=0 saved)\n")
 
@@ -449,7 +487,8 @@ def main() -> None:
             steps_until_save = next_save_step - steps_done
             chunk = min(CHUNK_SIZE, steps_remaining, steps_until_save)
 
-            forcing = _build_forcing(chunk, grid)
+            # Model time from the step counter (exact; state.time is float32)
+            forcing = forcing_for(steps_done * DT, chunk)
 
             t0 = _time.perf_counter()
             state, _ = _run_chunk(state, chunk, forcing)
@@ -461,7 +500,7 @@ def main() -> None:
             sim_day = float(state.time) / 86400.0 if state.time.ndim == 0 \
                       else float(state.time[0])   / 86400.0
 
-            bad = _diag_line(state, sim_day, steps_done, wall)
+            bad = _diag_line(state, sim_day, steps_done, wall, grid)
 
             if steps_done == next_save_step:
                 _write_snapshot(ds, state)

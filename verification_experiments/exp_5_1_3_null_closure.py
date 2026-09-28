@@ -42,7 +42,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from OceanJAX.grid import OceanGrid
 from OceanJAX.state import ModelParams
-from OceanJAX.data.oras5 import read_oras5, regrid_to_model, read_oras5_forcing, regrid_forcing
+from OceanJAX.data.oras5 import (read_oras5, regrid_to_model, read_oras5_forcing,
+                                  regrid_forcing, oras5_grid)
+from OceanJAX.Physics.mixing import munk_viscosity
 from OceanJAX.timeStepping import run, SurfaceForcing
 from OceanJAX.ml.closure import NullClosure
 
@@ -69,16 +71,15 @@ N_STEPS      = 288   # 1 day
 # Build grid and initial state
 # ---------------------------------------------------------------------------
 print("Loading ORAS5 state ...", flush=True)
-grid = OceanGrid.create(
-    lon_bounds=LON, lat_bounds=LAT,
-    depth_levels=DEPTH_LEVELS,
-    Nx=NX, Ny=NY,
-)
-params = ModelParams(dt=DT)
-
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     raw   = read_oras5(ORAS5_PATH, time_index=0)
+    # Land mask + bathymetry from ORAS5; closed east/west walls
+    grid  = oras5_grid(raw, LON, LAT, DEPTH_LEVELS, NX, NY, periodic_x=False)
+    # Horizontal eddy viscosity from the Munk criterion for this grid
+    NU_H = munk_viscosity(grid)
+    print(f"  nu_h = {NU_H:.3g} m2/s (Munk criterion)")
+    params = ModelParams(nu_h=NU_H, dt=DT)
     state = regrid_to_model(raw, grid)
 
 # Zero out velocities and eta (oras5_cold mode)

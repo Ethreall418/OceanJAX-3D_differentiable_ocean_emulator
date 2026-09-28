@@ -39,6 +39,17 @@ class ModelParams(eqx.Module):
     kappa_h: float   # horizontal tracer diffusivity [m^2 s-1]
     kappa_v: float   # background vertical tracer diffusivity [m^2 s-1]
 
+    # ---- bottom drag (quadratic, implicit) --------------------------------
+    bottom_drag_cd:  float   # drag coefficient Cd [-]; 0 = free-slip bottom
+    bottom_drag_ubg: float   # background speed for unresolved tides/eddies [m s-1]
+
+    # ---- freezing point ---------------------------------------------------
+    # T is limited from below by T_f = -freezing_slope * S (surface freezing
+    # point, linear in S).  This stands in for sea ice: without it, ORAS5
+    # heat fluxes of -2000 W m-2 under ice cool open water without bound.
+    freezing_slope: float                        # [K psu-1]
+    limit_freezing: bool = eqx.field(static=True)
+
     # ---- time stepping ----------------------------------------------------
     dt:            float   # timestep [s]
     asselin_coeff: float   # Asselin–Robert filter coefficient (default 0.1)
@@ -59,6 +70,10 @@ class ModelParams(eqx.Module):
         nu_v: float = 1e-4,
         kappa_h: float = 100.0,
         kappa_v: float = 1e-5,
+        bottom_drag_cd: float = 1e-3,
+        bottom_drag_ubg: float = 0.05,
+        freezing_slope: float = 0.0575,
+        limit_freezing: bool = True,
         dt: float = 900.0,
         asselin_coeff: float = 0.1,
         ab3_coeffs: tuple = (23.0 / 12.0, -16.0 / 12.0, 5.0 / 12.0),
@@ -73,6 +88,10 @@ class ModelParams(eqx.Module):
         self.nu_v         = nu_v
         self.kappa_h      = kappa_h
         self.kappa_v      = kappa_v
+        self.bottom_drag_cd  = bottom_drag_cd
+        self.bottom_drag_ubg = bottom_drag_ubg
+        self.freezing_slope  = freezing_slope
+        self.limit_freezing  = limit_freezing
         self.dt           = dt
         self.asselin_coeff = asselin_coeff
         self.ab3_coeffs   = ab3_coeffs

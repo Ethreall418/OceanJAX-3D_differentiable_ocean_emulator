@@ -23,11 +23,17 @@ tendencies that the time stepper adds before advancing.
 Contents
 --------
 thomas_algorithm          – differentiable tridiagonal solver via lax.scan
+_solve_increment          – solves for the increment (no float32 bias on
+                            uniform columns)
 implicit_vertical_mix     – implicit vertical diffusion for tracers
 implicit_vertical_visc    – implicit vertical diffusion for velocities (u or v)
-                            uses velocity-consistent vertical face masks
+                            uses velocity-consistent vertical face masks;
+                            optional implicit bottom drag
+bottom_cell_mask          – indicator of each column's deepest wet cell
+bottom_drag_velocity      – quadratic drag velocity Cd*|u_b| at u/v points
 _laplacian_u / _v         – scalar Laplacian at u- / v-points with correct metrics
 horizontal_viscosity      – Laplacian viscosity tendency for (u, v)
+munk_viscosity            – resolution-dependent nu_h resolving the Munk layer
 richardson_number         – raw (unclipped) gradient Richardson number
 ri_based_diffusivity      – Richardson-number shear/convection diffusivity
 """
@@ -36,6 +42,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from OceanJAX.grid import OceanGrid
 
@@ -172,6 +179,37 @@ def _build_tridiag_implicit(kappa: jnp.ndarray, dz_c: jnp.ndarray,
     return a, b, c
 
 
+def _solve_increment(
+    a:  jnp.ndarray,
+    c:  jnp.ndarray,
+    e:  jnp.ndarray,
+    x0: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Solve  A x = x0  for one column, where A = tridiag(a, 1 - a - c + e, c)
+    is an implicit diffusion operator (a, c from ``_build_tridiag_implicit``)
+    plus a non-negative extra diagonal e (e.g. implicit bottom drag; pass
+    zeros for pure diffusion).
+
+    Solving for the full field accumulates a systematic float32 bias: for a
+    uniform column the forward sweep rounds the bottom row so that x[-1]
+    comes out one ulp high on every call (+3.8e-6 psu per step at S=35,
+    +0.033 psu in 30 days).  Instead we solve for the increment
+    delta = x - x0, whose right-hand side is formed from differences only:
+
+      A delta = x0 - A x0 = -( a (x0[k-1] - x0[k]) + c (x0[k+1] - x0[k]) + e x0[k] )
+
+    A uniform column (with e = 0) gives a right-hand side that is exactly
+    zero, hence delta = 0 exactly, and rounding errors elsewhere scale with
+    the increment rather than with the field itself.
+    """
+    b      = 1.0 - a - c + e
+    x_up   = jnp.concatenate([x0[:1],  x0[:-1]])            # x0[k-1] (a[0] = 0)
+    x_dn   = jnp.concatenate([x0[1:],  x0[-1:]])            # x0[k+1] (c[-1] = 0)
+    rhs    = -(a * (x_up - x0) + c * (x_dn - x0) + e * x0)
+    return x0 + thomas_algorithm(a, b, c, rhs)
+
+
 # ---------------------------------------------------------------------------
 # Implicit vertical diffusion for tracers
 # ---------------------------------------------------------------------------
@@ -217,13 +255,13 @@ def implicit_vertical_mix(
 
     def solve_column(phi_col, kappa_col, rhs_col, mask_w_col, mask_c_col):
         """Solve one (i,j) column. All inputs are 1-D in z."""
-        a, b, c = _build_tridiag_implicit(
+        a, _, c = _build_tridiag_implicit(
             kappa_col, grid.dz_c, grid.dz_w, dt, mask_w_col
         )
         # For dry cells, the system degenerates; keep phi = 0 there.
         # The mask on the diagonal (b=1 for dry cells, a=c=0) achieves this
         # naturally since rhs = 0 for dry cells.
-        phi_new = thomas_algorithm(a, b, c, rhs_col * mask_c_col)
+        phi_new = _solve_increment(a, c, jnp.zeros_like(a), rhs_col * mask_c_col)
         return phi_new * mask_c_col
 
     # vmap over (i, j) simultaneously by flattening the horizontal dims
@@ -255,15 +293,22 @@ def implicit_vertical_visc(
     dt:    float,
     grid:  OceanGrid,
     mask:  jnp.ndarray,
+    drag:  jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """
-    Implicitly mix a horizontal velocity component in the vertical direction.
+    Implicitly mix a horizontal velocity component in the vertical direction,
+    optionally with an implicit bottom drag.
 
     Uses a velocity-consistent vertical face mask: internal face k is active
     only when both ``mask[..., k-1]`` and ``mask[..., k]`` are 1, matching the
     actual grid locations of u or v rather than the tracer mask_w.  Using the
     tracer mask_w would incorrectly couple layers at seamount edges where a
     u- or v-column is entirely dry despite adjacent tracer columns being wet.
+
+    Bottom drag enters as a linear damping rate on the deepest wet cell of
+    each column,  d(vel)/dt = -r * vel  with  r = drag / dz_c[k_bot]  [s⁻¹],
+    and is added to the diagonal of the implicit system, so it is
+    unconditionally stable for any drag coefficient.
 
     Args:
         vel   : (Nx, Ny, Nz)    velocity component at time n
@@ -272,6 +317,8 @@ def implicit_vertical_visc(
         grid  : OceanGrid
         mask  : (Nx, Ny, Nz)   wet mask for this velocity component
                                 (mask_u for u, mask_v for v)
+        drag  : (Nx, Ny) bottom drag velocity [m s⁻¹] (e.g. Cd*|u_bot| for
+                quadratic drag), or None for a free-slip bottom.
 
     Returns:
         vel^{n+1} : (Nx, Ny, Nz)
@@ -288,19 +335,69 @@ def implicit_vertical_visc(
     mask_w_vel = jnp.zeros((Nx, Ny, Nz + 1), dtype=mask.dtype)
     mask_w_vel = mask_w_vel.at[:, :, 1:Nz].set(mask[:, :, :-1] * mask[:, :, 1:])
 
-    def solve_column(vel_col, nu_col, mask_w_col, mask_col):
-        a, b, c = _build_tridiag_implicit(
+    # Extra diagonal: dt * drag / dz on the deepest wet cell of each column
+    if drag is None:
+        e = jnp.zeros((Nx, Ny, Nz), dtype=vel.dtype)
+    else:
+        e = (dt * drag[:, :, jnp.newaxis] / grid.dz_c) * bottom_cell_mask(mask)
+
+    def solve_column(vel_col, nu_col, e_col, mask_w_col, mask_col):
+        a, _, c = _build_tridiag_implicit(
             nu_col, grid.dz_c, grid.dz_w, dt, mask_w_col
         )
-        return thomas_algorithm(a, b, c, vel_col * mask_col) * mask_col
+        return _solve_increment(a, c, e_col, vel_col * mask_col) * mask_col
 
     vel_2d    = vel.reshape(Nx * Ny, Nz)
     nu_2d     = nu_v.reshape(Nx * Ny, Nz + 1)
+    e_2d      = e.reshape(Nx * Ny, Nz)
     mask_w_2d = mask_w_vel.reshape(Nx * Ny, Nz + 1)
     mask_2d   = mask.reshape(Nx * Ny, Nz)
 
-    vel_new_2d = jax.vmap(solve_column)(vel_2d, nu_2d, mask_w_2d, mask_2d)
+    vel_new_2d = jax.vmap(solve_column)(vel_2d, nu_2d, e_2d, mask_w_2d, mask_2d)
     return vel_new_2d.reshape(Nx, Ny, Nz)
+
+
+def bottom_cell_mask(mask: jnp.ndarray) -> jnp.ndarray:
+    """
+    (Nx, Ny, Nz) indicator of the deepest wet cell of each column: 1 where
+    ``mask[..., k] = 1`` and the cell below is dry (or k = Nz-1).
+    """
+    below = jnp.concatenate(
+        [mask[..., 1:], jnp.zeros_like(mask[..., :1])], axis=-1
+    )
+    return mask * (1.0 - below)
+
+
+def bottom_drag_velocity(
+    u:      jnp.ndarray,
+    v:      jnp.ndarray,
+    grid:   OceanGrid,
+    params,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Quadratic bottom-drag velocity  Cd * sqrt(|u_b|^2 + u_bg^2)  at u- and
+    v-points, (Nx, Ny) each [m s⁻¹].
+
+    u_b is the velocity of the deepest wet cell.  The cross component is
+    interpolated with the same 4-point averages as the Coriolis term, at
+    the same level.  u_bg (``params.bottom_drag_ubg``) is a background
+    speed standing in for unresolved tides and eddies, so the drag stays
+    active for weak flows.  With ``params.bottom_drag_cd = 0`` the result
+    is exactly zero.
+    """
+    from OceanJAX.Physics.dynamics import v_at_u_points, u_at_v_points   # deferred
+
+    bot_u = bottom_cell_mask(grid.mask_u)
+    bot_v = bottom_cell_mask(grid.mask_v)
+    ub      = jnp.sum(u * bot_u, axis=-1)                           # (Nx, Ny)
+    vb      = jnp.sum(v * bot_v, axis=-1)
+    vb_at_u = jnp.sum(v_at_u_points(v, grid) * bot_u, axis=-1)
+    ub_at_v = jnp.sum(u_at_v_points(u, grid) * bot_v, axis=-1)
+
+    ubg2   = params.bottom_drag_ubg ** 2
+    drag_u = params.bottom_drag_cd * jnp.sqrt(ub ** 2 + vb_at_u ** 2 + ubg2)
+    drag_v = params.bottom_drag_cd * jnp.sqrt(ub_at_v ** 2 + vb ** 2 + ubg2)
+    return drag_u, drag_v
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +490,10 @@ def _laplacian_v(
     # Distance between v[i] and v[i+1] ≈ 0.5*(dx_v[i] + dx_v[i+1])
     dist_e   = 0.5 * (grid.dx_v + jnp.roll(grid.dx_v, -1, axis=0))[:, :, jnp.newaxis]
     mv_ee    = grid.mask_v * jnp.roll(grid.mask_v, -1, axis=0)
+    if not grid.periodic_x:
+        # This flux is gated by mask_v, not mask_u, so the east/west wall
+        # must be closed explicitly: no v[Nx-1] <-> v[0] wrap-around.
+        mv_ee = mv_ee.at[-1, :, :].set(0.0)
     fx_e     = nu_h * grid.dy_v[:, :, jnp.newaxis] * (v_e - v) / dist_e * mv_ee
     fx_w     = jnp.roll(fx_e, 1, axis=0)
 
@@ -443,6 +544,45 @@ def horizontal_viscosity(
         (du_dt_visc, dv_dt_visc) : each (Nx, Ny, Nz)
     """
     return _laplacian_u(u, nu_h, grid), _laplacian_v(v, nu_h, grid)
+
+
+def munk_viscosity(grid: OceanGrid, n_points: float = 1.0) -> float:
+    """
+    Horizontal eddy viscosity [m² s⁻¹] that resolves the Munk western
+    boundary layer on this grid.
+
+    nu_h in a coarse model is not the molecular viscosity of seawater
+    (~1e-6 m² s⁻¹) but a closure for momentum mixing by unresolved motions,
+    so it must scale with resolution.  The Munk layer width is
+
+        delta_M = (nu_h / beta)^(1/3),
+
+    and if delta_M is narrower than the grid spacing the discrete western
+    boundary current degenerates into 2-dx noise that grows without bound
+    (Bryan, Manabe & Pacanowski 1975).  Requiring delta_M >= n_points * dx
+    gives
+
+        nu_h >= beta(phi) * (n_points * dx(phi))^3.
+
+    Because beta ∝ cos(phi) and dx ∝ cos(phi), the bound ∝ cos^4(phi) is
+    largest at the latitude closest to the equator; the maximum over all
+    wet columns is returned as a single domain-wide value.
+
+    Args:
+        grid     : OceanGrid (uses lat_c, dx_c, mask_c)
+        n_points : number of grid points across the Munk layer (default 1)
+
+    Returns:
+        nu_h as a Python float, ready for ``ModelParams(nu_h=...)``.
+    """
+    from OceanJAX.grid import EARTH_RADIUS, OMEGA, DEG2RAD
+
+    lat  = np.asarray(grid.lat_c, dtype=np.float64) * DEG2RAD             # (Ny,)
+    beta = 2.0 * OMEGA * np.cos(lat) / EARTH_RADIUS                       # (Ny,)
+    dx   = np.asarray(grid.dx_c, dtype=np.float64)                        # (Nx, Ny)
+    wet  = np.asarray(grid.mask_c)[:, :, 0] > 0
+    bound = beta[np.newaxis, :] * (n_points * dx) ** 3
+    return float(bound[wet].max()) if np.any(wet) else float(bound.max())
 
 
 # ---------------------------------------------------------------------------

@@ -24,8 +24,10 @@ Free surface — Leapfrog update (eta_prev + 2*dt * deta_dt), consistent with
                the momentum leapfrog, with an Asselin-Robert filter on eta.
                Bootstrap at step_count == 0: uses 1*dt (Forward Euler start),
                identical to the momentum bootstrap.
-               The diagnosed w field is then updated so that its surface face
-               (k=0) carries the kinematic signal w[0] = deta/dt.
+               w is diagnosed upward from the seafloor, so its surface face
+               carries the kinematic signal w[0] = -deta/dt (w positive
+               downward) and tracers are advected with a non-divergent
+               (u, v, w).
 
 Division of labour with Physics modules
 ----------------------------------------
@@ -90,6 +92,7 @@ from OceanJAX.Physics.tracers import (
 from OceanJAX.Physics.mixing import (
     implicit_vertical_visc,
     implicit_vertical_mix,
+    bottom_drag_velocity,
 )
 
 
@@ -201,14 +204,16 @@ def step(
     3.  Leapfrog momentum advance:  u_new = u_prev + 2*dt * G_u
     4.  Asselin-Robert filter on u(n):
           u_filt = u + alpha*(u_new - 2*u + u_prev)
-    5.  Implicit vertical viscosity applied to u_new, v_new.
-    6.  Explicit tracer tendencies (advection + horiz. diffusion).
-        + Heat flux / freshwater surface forcing (if supplied).
+    5.  Implicit vertical viscosity + quadratic bottom drag on u_new, v_new.
+    6.  Diagnose w from (u_filt, v_filt), bottom-up; w[0] = -deta/dt.
+    7.  Explicit tracer tendencies (advection with u_filt, v_filt, w
+        + horiz. diffusion) + heat / freshwater surface forcing.
         [ML hook] closure corrections to G_T, G_S and kappa_v (if supplied).
-    7.  Adams-Bashforth 3 tracer advance.
-    8.  Implicit vertical diffusion applied to T_new, S_new.
-    9.  Free-surface update: eta_new = eta + dt * deta_dt
-    10. Diagnose w from continuity; set w[0] = deta_dt (kinematic BC).
+    8.  Adams-Bashforth 3 tracer advance.
+    9.  Implicit vertical diffusion applied to T_new, S_new; freezing-point
+        limit T >= -freezing_slope * S (if params.limit_freezing).
+    10. Free-surface leapfrog: eta_new = eta_prev + 2*dt * deta_dt,
+        plus Asselin filter on eta(n).
     11. Apply all masks and assemble new OceanState.
 
     Args:
@@ -264,19 +269,31 @@ def step(
     v_filt = (state.v + alpha * (v_new - 2.0 * state.v + state.v_prev)) * grid.mask_v
 
     # ------------------------------------------------------------------
-    # 5. Implicit vertical viscosity (applied to the leapfrog result)
+    # 5. Implicit vertical viscosity + quadratic bottom drag
+    #    Drag velocity Cd*|u_b| is evaluated at time n (semi-implicit) and
+    #    applied implicitly to the deepest wet cell of each column, so it
+    #    is unconditionally stable.  bottom_drag_cd = 0 disables it.
     # ------------------------------------------------------------------
-    u_new = implicit_vertical_visc(u_new, params.nu_v, dt, grid, grid.mask_u)
-    v_new = implicit_vertical_visc(v_new, params.nu_v, dt, grid, grid.mask_v)
+    drag_u, drag_v = bottom_drag_velocity(state.u, state.v, grid, params)
+    u_new = implicit_vertical_visc(u_new, params.nu_v, dt, grid, grid.mask_u, drag_u)
+    v_new = implicit_vertical_visc(v_new, params.nu_v, dt, grid, grid.mask_v, drag_v)
 
     # ------------------------------------------------------------------
-    # 6. Explicit tracer tendencies
-    #    Use Asselin-filtered velocities for advection so that the
-    #    tracer and momentum fields see a consistent velocity state.
+    # 6. Diagnose w from the Asselin-filtered velocities
+    #    compute_w integrates upward from w = 0 at the seafloor, so its
+    #    surface face is the kinematic value w[0] = -deta/dt of the same
+    #    u_filt/v_filt that drive eta below.  Every cell of (u_filt,
+    #    v_filt, w_new) is exactly non-divergent.
     # ------------------------------------------------------------------
-    # Use current w (not yet updated) for tracer advection
-    G_T = tracer_tendency(state.T, u_filt, v_filt, state.w, params.kappa_h, grid)
-    G_S = tracer_tendency(state.S, u_filt, v_filt, state.w, params.kappa_h, grid)
+    w_new = compute_w(u_filt, v_filt, grid)
+
+    # ------------------------------------------------------------------
+    # 7. Explicit tracer tendencies
+    #    Advect with (u_filt, v_filt, w_new) — one continuity-consistent
+    #    velocity state, so a uniform tracer stays exactly uniform.
+    # ------------------------------------------------------------------
+    G_T = tracer_tendency(state.T, u_filt, v_filt, w_new, params.kappa_h, grid)
+    G_S = tracer_tendency(state.S, u_filt, v_filt, w_new, params.kappa_h, grid)
 
     if forcing is not None:
         G_T = G_T + heat_surface_tendency(forcing.heat_flux, grid, params)
@@ -296,7 +313,7 @@ def step(
         kappa_v = params.kappa_v
 
     # ------------------------------------------------------------------
-    # 7. Adams-Bashforth 3 tracer advance
+    # 8. Adams-Bashforth 3 tracer advance
     #    Select coefficients based on step_count for proper bootstrap:
     #      step_count == 0  →  AB1: (1,    0,    0  )
     #      step_count == 1  →  AB2: (3/2, -1/2,  0  )
@@ -315,7 +332,7 @@ def step(
                              + a2 * state.S_tend_prev2)) * grid.mask_c
 
     # ------------------------------------------------------------------
-    # 8. Implicit vertical diffusion
+    # 9. Implicit vertical diffusion
     #    kappa_v is either params.kappa_v (pure physics) or
     #    params.kappa_v * corr.kappa_v_scale (when closure is active).
     # ------------------------------------------------------------------
@@ -324,8 +341,13 @@ def step(
     S_new = implicit_vertical_mix(S_new, kappa_v, dt, grid,
                                   rhs_explicit=jnp.zeros_like(S_new))
 
+    # Freezing-point limit (stand-in for sea ice): T >= -freezing_slope * S.
+    # Heat removed below T_f is discarded, as if it went into ice formation.
+    if params.limit_freezing:
+        T_new = jnp.maximum(T_new, -params.freezing_slope * S_new) * grid.mask_c
+
     # ------------------------------------------------------------------
-    # 9. Free-surface update (leapfrog, consistent with momentum)
+    # 10. Free-surface update (leapfrog, consistent with momentum)
     #    Bootstrap (step_count == 0): 1*dt Forward Euler start so that
     #    eta_prev = eta gives eta_new = eta + dt*deta_dt.
     #    Subsequent steps: eta_new = eta_prev + 2*dt * deta_dt.
@@ -335,16 +357,6 @@ def step(
     surf_mask = grid.mask_c[:, :, 0]
     eta_new   = (state.eta_prev + leapfrog_dt * deta_dt) * surf_mask
     eta_filt  = (state.eta + alpha * (eta_new - 2.0 * state.eta + state.eta_prev)) * surf_mask
-
-    # ------------------------------------------------------------------
-    # 10. Diagnose w; impose kinematic BC w[0] = deta/dt
-    #    Use u_filt/v_filt — the same velocity state used for eta — so
-    #    that the surface BC and the interior continuity diagnosis are
-    #    consistent within the step.
-    # ------------------------------------------------------------------
-    w_new = compute_w(u_filt, v_filt, grid)
-    # Set the surface face to the kinematic signal; mask_w gates it.
-    w_new = w_new.at[:, :, 0].set(deta_dt * grid.mask_w[:, :, 0])
 
     # ------------------------------------------------------------------
     # 11. Assemble new state

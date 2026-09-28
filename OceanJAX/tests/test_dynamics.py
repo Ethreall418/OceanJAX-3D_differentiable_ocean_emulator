@@ -10,9 +10,8 @@ Three groups of properties are verified:
        the integration formula for a single-layer anomaly.
 
   2. Continuity: compute_w satisfies div_h + div_z(w) = 0 exactly
-       This is the design contract of compute_w for any (u, v) field.
-       Bottom-w = 0 is also checked for the special case of globally
-       non-divergent (uniform zonal) flow.
+       in every layer, for any (u, v) field and with stepped bathymetry;
+       the surface face carries w[0] = -deta/dt.
 
   3. Coriolis sign tests
        The 4-point-average Coriolis on a C-grid does not conserve KE
@@ -169,9 +168,8 @@ class TestComputeW:
 
       div_h(u, v)[i,j,k]  +  (w[i,j,k+1] - w[i,j,k]) / dz_c[k]  =  0
 
-    This must hold for *any* (u, v) field, not just divergence-free ones.
-    The bottom-w = 0 property is an additional check for the special case
-    of globally non-divergent (uniform zonal periodic) flow.
+    This must hold for *any* (u, v) field, not just divergence-free ones,
+    in every layer including the surface and bottom layers.
     """
 
     def test_zero_velocity_gives_zero_w(self, flat_grid):
@@ -212,45 +210,83 @@ class TestComputeW:
             f"Expected shape {(grid.Nx, grid.Ny, grid.Nz+1)}, got {w.shape}"
         )
 
+    @staticmethod
+    def _random_flow(grid, seed=0):
+        key = jax.random.PRNGKey(seed)
+        u = jax.random.normal(key, (grid.Nx, grid.Ny, grid.Nz)) * grid.mask_u
+        v = jax.random.normal(jax.random.fold_in(key, 1),
+                              (grid.Nx, grid.Ny, grid.Nz)) * grid.mask_v
+        return u, v
+
+    @staticmethod
+    def _div_h(u, v, grid):
+        """Independent flux-form horizontal divergence at cell centres."""
+        Fu    = u * grid.mask_u * grid.dy_c[:, :, jnp.newaxis]
+        dFu   = Fu - jnp.roll(Fu, 1, axis=0)
+        Fv    = v * grid.mask_v * grid.dx_v[:, :, jnp.newaxis]
+        Fv_s  = jnp.concatenate(
+            [jnp.zeros((grid.Nx, 1, grid.Nz), dtype=u.dtype), Fv[:, :-1, :]], axis=1
+        )
+        return (dFu + (Fv - Fv_s)) / grid.area_c[:, :, jnp.newaxis]
+
+    def _assert_continuity(self, u, v, w, grid):
+        div_h   = self._div_h(u, v, grid)
+        div_z_w = (w[:, :, 1:] - w[:, :, :-1]) / grid.dz_c
+        residual = (div_h + div_z_w) * grid.mask_c
+        scale    = float(jnp.max(jnp.abs(div_h * grid.mask_c)))
+        assert scale > 0.0
+        rel = float(jnp.max(jnp.abs(residual))) / scale
+        # Relative to the divergence itself: an absolute tolerance would be
+        # vacuous because div_h ~ 1e-6 s-1 on a ~1000 km grid.
+        assert rel < 1e-5, f"relative continuity residual {rel:.3e} (all layers)"
+
     def test_continuity_residual_random_flow(self, flat_grid):
-        """compute_w satisfies div_h + div_z(w) = 0 for arbitrary (u, v).
+        """compute_w satisfies div_h + div_z(w) = 0 in EVERY layer.
 
         This is the fundamental design contract of compute_w.  The residual
         is computed independently from the returned w and the same area
         metrics used in the flux-form divergence, so the test is a genuine
         physical check rather than a tautological re-run of the integrator.
+        Integrating upward from w[Nz] = 0 makes the surface and bottom
+        layers satisfy continuity too; the column imbalance appears as
+        w[0] = -deta/dt instead of as a spurious bottom source.
         """
         grid = flat_grid
-        key  = jax.random.PRNGKey(0)
-        u = jax.random.normal(key, (grid.Nx, grid.Ny, grid.Nz)) * grid.mask_u
-        v = jax.random.normal(jax.random.fold_in(key, 1),
-                              (grid.Nx, grid.Ny, grid.Nz)) * grid.mask_v
+        u, v = self._random_flow(grid)
+        self._assert_continuity(u, v, compute_w(u, v, grid), grid)
 
+    def test_surface_w_is_minus_deta_dt(self, flat_grid):
+        """w[0] = -deta/dt (w positive downward; rising surface = upward w)."""
+        from OceanJAX.Physics.dynamics import free_surface_tendency
+        grid = flat_grid
+        u, v = self._random_flow(grid, seed=3)
+        w    = compute_w(u, v, grid)
+        deta = free_surface_tendency(u, v, grid)
+        scale = float(jnp.max(jnp.abs(deta)))
+        assert scale > 0.0
+        err = float(jnp.max(jnp.abs(w[:, :, 0] + deta))) / scale
+        assert err < 1e-5, f"relative |w[0] + deta/dt| = {err:.3e}"
+
+    def test_continuity_with_bathymetry(self):
+        """Stepped bathymetry and land: continuity holds in all wet cells and
+        w vanishes at the bottom face of each column's deepest wet cell."""
+        z_levels = np.array([5.0, 20.0, 50.0, 100.0])
+        H = np.full((5, 4), 200.0)
+        H[1, 1] = 30.0      # two wet levels
+        H[3, 2] = 10.0      # one wet level
+        H[0, 3] = 0.0       # land column
+        grid = OceanGrid.create((0.0, 40.0), (10.0, 50.0), z_levels, 5, 4,
+                                bathymetry=H)
+        u, v = self._random_flow(grid, seed=7)
         w = compute_w(u, v, grid)
+        self._assert_continuity(u, v, w, grid)
 
-        # Recompute horizontal divergence independently (flux form)
-        Fu    = u * grid.mask_u * grid.dy_c[:, :, jnp.newaxis]
-        dFu   = Fu - jnp.roll(Fu, 1, axis=0)
-
-        Fv    = v * grid.mask_v * grid.dx_v[:, :, jnp.newaxis]
-        Fv_s  = jnp.concatenate(
-            [jnp.zeros((grid.Nx, 1, grid.Nz), dtype=u.dtype), Fv[:, :-1, :]], axis=1
-        )
-        dFv   = Fv - Fv_s
-        div_h = (dFu + dFv) / grid.area_c[:, :, jnp.newaxis]   # (Nx, Ny, Nz)
-
-        # Vertical divergence of w at cell centres
-        div_z_w = (w[:, :, 1:] - w[:, :, :-1]) / grid.dz_c     # (Nx, Ny, Nz)
-
-        residual = (div_h + div_z_w) * grid.mask_c
-
-        # The hard-wall BC mask_w[:,:,Nz]=0 forces w[bottom]=0 regardless of
-        # flow divergence, so the deepest layer (k=Nz-1) does not satisfy
-        # continuity for arbitrary (u,v).  Test only the interior layers.
-        assert jnp.allclose(residual[:, :, :-1], 0.0, atol=1e-5), (
-            f"Continuity residual (k=0..Nz-2) max = "
-            f"{jnp.max(jnp.abs(residual[:,:,:-1])):.3e} s-1"
-        )
+        n_wet = np.asarray(grid.mask_c).sum(axis=-1).astype(int)   # (Nx, Ny)
+        w_np  = np.asarray(w)
+        for i in range(grid.Nx):
+            for j in range(grid.Ny):
+                assert w_np[i, j, n_wet[i, j]] == 0.0, (i, j, n_wet[i, j])
+        assert np.all(w_np[0, 3, :] == 0.0), "land column must have w = 0"
 
 
 # ---------------------------------------------------------------------------
