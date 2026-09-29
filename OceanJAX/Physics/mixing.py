@@ -128,6 +128,19 @@ def thomas_algorithm(
     return x
 
 
+def _vmap_columns(solve_column):
+    """
+    Map a single-column solver over the (i, j) axes of (Nx, Ny, ...) inputs.
+
+    Nested vmaps (rather than reshaping to (Nx*Ny, Nz)) keep x and y as
+    separate array axes, so a field sharded over a device mesh in x and y
+    stays sharded: merging two sharded axes in a reshape would force XLA
+    to all-gather the whole field onto every device.  The per-column
+    arithmetic is identical either way.
+    """
+    return jax.vmap(jax.vmap(solve_column))
+
+
 def _build_tridiag_implicit(kappa: jnp.ndarray, dz_c: jnp.ndarray,
                              dz_w: jnp.ndarray, dt: float,
                              mask_w_col: jnp.ndarray) -> tuple:
@@ -230,7 +243,8 @@ def implicit_vertical_mix(
       (I - dt * L_v) phi^{n+1} = phi^n + dt * rhs_explicit
 
     where L_v is the vertical diffusion operator.  A separate call to
-    ``thomas_algorithm`` is made for each (i, j) column via ``jax.vmap``.
+    ``thomas_algorithm`` is made for each (i, j) column via nested
+    ``jax.vmap`` (see ``_vmap_columns``).
 
     Args:
         phi          : (Nx, Ny, Nz)    tracer field at time n
@@ -265,23 +279,15 @@ def implicit_vertical_mix(
         phi_new = _solve_increment(a, c, jnp.zeros_like(a), rhs_col * mask_c_col)
         return phi_new * mask_c_col
 
-    # vmap over (i, j) simultaneously by flattening the horizontal dims
-    phi_2d    = phi.reshape(Nx * Ny, Nz)
-    kappa_2d  = kappa.reshape(Nx * Ny, Nz + 1)
-    rhs_2d    = rhs.reshape(Nx * Ny, Nz)
     # Use mask_w_adv (surface face k=0 always closed) so that the implicit
     # diffusion operator has no flux through the sea surface.  The surface
     # tracer exchange is handled exclusively by the explicit forcing tendencies
     # in tracers.py, exactly as for tracer advection.  Using mask_w here would
     # open a spurious diffusive flux at k=0 (a[0] ≠ 0 in the tridiagonal
     # system), corrupting the top-layer temperature even in a resting ocean.
-    mask_w_2d = grid.mask_w_adv.reshape(Nx * Ny, Nz + 1)
-    mask_c_2d = grid.mask_c.reshape(Nx * Ny, Nz)
-
-    phi_new_2d = jax.vmap(solve_column)(
-        phi_2d, kappa_2d, rhs_2d, mask_w_2d, mask_c_2d
+    return _vmap_columns(solve_column)(
+        phi, kappa, rhs, grid.mask_w_adv, grid.mask_c
     )
-    return phi_new_2d.reshape(Nx, Ny, Nz)
 
 
 # ---------------------------------------------------------------------------
@@ -348,14 +354,7 @@ def implicit_vertical_visc(
         )
         return _solve_increment(a, c, e_col, vel_col * mask_col) * mask_col
 
-    vel_2d    = vel.reshape(Nx * Ny, Nz)
-    nu_2d     = nu_v.reshape(Nx * Ny, Nz + 1)
-    e_2d      = e.reshape(Nx * Ny, Nz)
-    mask_w_2d = mask_w_vel.reshape(Nx * Ny, Nz + 1)
-    mask_2d   = mask.reshape(Nx * Ny, Nz)
-
-    vel_new_2d = jax.vmap(solve_column)(vel_2d, nu_2d, e_2d, mask_w_2d, mask_2d)
-    return vel_new_2d.reshape(Nx, Ny, Nz)
+    return _vmap_columns(solve_column)(vel, nu_v, e, mask_w_vel, mask)
 
 
 def bottom_cell_mask(mask: jnp.ndarray) -> jnp.ndarray:

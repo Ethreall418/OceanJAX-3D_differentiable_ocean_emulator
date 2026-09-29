@@ -165,7 +165,8 @@ class TestShardedEnsembleRun:
 
         ref_final, _ = batch_run(batched, small_grid, default_params, n_steps=N_STEPS)
         she_final, _ = sharded_ensemble_run(batched, small_grid, default_params,
-                                             n_steps=N_STEPS)
+                                             n_steps=N_STEPS,
+                                             devices=jax.devices()[:1])
 
         np.testing.assert_array_equal(
             np.array(ref_final.T),
@@ -178,12 +179,27 @@ class TestShardedEnsembleRun:
             err_msg="eta differs between batch_run and sharded_ensemble_run",
         )
 
+    def test_multi_device_matches_batch_run(self, base_state, small_grid, default_params):
+        """Members spread over 2 devices match batch_run bit for bit (no cross-member ops)."""
+        if len(jax.devices()) < 2:
+            pytest.skip("needs 2 devices")
+        N = 2
+        batched = _make_batched(base_state, N)
+        ref_final, _ = batch_run(batched, small_grid, default_params, n_steps=N_STEPS)
+        she_final, _ = sharded_ensemble_run(batched, small_grid, default_params,
+                                             n_steps=N_STEPS,
+                                             devices=jax.devices()[:2])
+        assert len(she_final.T.sharding.device_set) == 2
+        np.testing.assert_array_equal(np.array(ref_final.T), np.array(she_final.T))
+        np.testing.assert_array_equal(np.array(ref_final.eta), np.array(she_final.eta))
+
     def test_finite_output(self, base_state, small_grid, default_params):
         """sharded_ensemble_run produces finite fields."""
         N = 2
         batched = _make_batched(base_state, N)
         final, _ = sharded_ensemble_run(batched, small_grid, default_params,
-                                         n_steps=N_STEPS)
+                                         n_steps=N_STEPS,
+                                         devices=jax.devices()[:1])
         assert np.all(np.isfinite(np.array(final.T)))
         assert np.all(np.isfinite(np.array(final.S)))
 

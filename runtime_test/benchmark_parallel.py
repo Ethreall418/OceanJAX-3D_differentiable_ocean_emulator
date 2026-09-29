@@ -1,23 +1,36 @@
 """
 benchmark_parallel.py
 =====================
-Wall-time comparison of three execution modes for identical workloads:
+Wall-time benchmarks for OceanJAX.parallel.
+
+Ensemble mode (default) — three execution modes for identical workloads:
 
   single_run         — jax.jit(run())  for a single OceanState
   batch_run          — eqx.filter_vmap over N ensemble members (1 GPU)
   sharded_ensemble   — NamedSharding across all available GPUs
 
+Domain mode — one large domain split over x / y (sharding.sharded_run):
+  times the same run on meshes of 1, 2, 4, ... devices and reports the
+  speed-up and parallel efficiency relative to one device.
+
 Usage
 -----
     python runtime_test/benchmark_parallel.py [N_ENSEMBLE] [N_STEPS]
+    python runtime_test/benchmark_parallel.py domain [N_STEPS] [NX NY NZ]
 
-Defaults: N_ENSEMBLE=4, N_STEPS=288 (one simulated day at dt=300 s).
+Defaults: N_ENSEMBLE=4, N_STEPS=288 (one simulated day at dt=300 s);
+domain mode NX, NY, NZ = 128, 96, 20 and N_STEPS=96.
+
+To try domain mode on a CPU-only machine, simulate devices with
+    XLA_FLAGS=--xla_force_host_platform_device_count=8
+(simulated devices share the same cores, so this checks that the
+decomposition runs, not that it is faster; measure speed-up on GPUs).
 
 Output
 ------
-Prints a table of wall times (compilation excluded) and throughput
-in member-steps/second.  On a single-device machine,
-sharded_ensemble_run falls back to batch_run, so the two should match.
+Prints a table of wall times (compilation excluded) and throughput.
+In ensemble mode on a single-device machine, sharded_ensemble_run falls
+back to batch_run, so the two should match.
 """
 
 from __future__ import annotations
@@ -29,6 +42,7 @@ from pathlib import Path
 import numpy as np
 import jax
 import jax.numpy as jnp
+import equinox as eqx
 
 # Allow running from repo root or from runtime_test/
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -37,17 +51,26 @@ from OceanJAX.grid import OceanGrid
 from OceanJAX.state import ModelParams, create_rest_state
 from OceanJAX.timeStepping import run as ocean_run
 from OceanJAX.parallel.ensemble import batch_run, sharded_ensemble_run
+from OceanJAX.parallel.sharding import make_mesh, shard_grid, shard_state, sharded_run
 
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-N_ENSEMBLE  = int(sys.argv[1]) if len(sys.argv) > 1 else 4
-N_STEPS     = int(sys.argv[2]) if len(sys.argv) > 2 else 288
-N_WARMUP    = N_STEPS           # one full run used as JIT warm-up
+DOMAIN_MODE = len(sys.argv) > 1 and sys.argv[1] == "domain"
+_args       = sys.argv[2:] if DOMAIN_MODE else sys.argv[1:]
+
+if DOMAIN_MODE:
+    N_ENSEMBLE = 1
+    N_STEPS    = int(_args[0]) if len(_args) > 0 else 96
+else:
+    N_ENSEMBLE = int(_args[0]) if len(_args) > 0 else 4
+    N_STEPS    = int(_args[1]) if len(_args) > 1 else 288
 
 NX, NY, NZ  = 20, 15, 10       # matches experiment.py default
+if DOMAIN_MODE:
+    NX, NY, NZ = (int(a) for a in _args[1:4]) if len(_args) >= 4 else (128, 96, 20)
 DT          = 300.0
 
 
@@ -168,5 +191,76 @@ def main():
     print("\nDone.")
 
 
+# ---------------------------------------------------------------------------
+# Domain decomposition mode
+# ---------------------------------------------------------------------------
+
+def _layouts(n_devices: int):
+    """
+    One (n_x, n_y) mesh per device count 1, 2, 4, ... <= n_devices: the
+    most nearly square layout that divides NX x NY.
+    """
+    out, n = [], 1
+    while n <= n_devices:
+        best = None
+        for n_x in range(1, n + 1):
+            if n % n_x:
+                continue
+            n_y = n // n_x
+            if NX % n_x or NY % n_y:
+                continue
+            # prefer square local blocks
+            score = abs(np.log((NX / n_x) / (NY / n_y)))
+            if best is None or score < best[0]:
+                best = (score, n_x, n_y)
+        if best is not None:
+            out.append(best[1:])
+        n *= 2
+    return out
+
+
+def main_domain():
+    n_devices = len(jax.devices())
+    print("=" * 64)
+    print("OceanJAX domain-decomposition benchmark")
+    print(f"  grid      : {NX}x{NY}x{NZ}  dt={DT} s")
+    print(f"  steps     : {N_STEPS}")
+    print(f"  devices   : {n_devices} x {jax.devices()[0].platform}")
+    print("=" * 64)
+
+    grid   = build_grid()
+    params = ModelParams(dt=DT, nu_h=2e4, vertical_mixing="pp81")
+    base   = create_rest_state(grid, T_background=10.0, S_background=35.0)
+    # A little structure so the solvers do real work.
+    rng    = np.random.default_rng(0)
+    noise  = jnp.asarray(rng.normal(0.0, 0.1, base.T.shape), jnp.float32)
+    base   = eqx.tree_at(lambda s: s.T, base, base.T + noise * grid.mask_c)
+
+    rows = []
+    for n_x, n_y in _layouts(n_devices):
+        mesh   = make_mesh(n_x, n_y)
+        grid_s = shard_grid(grid, mesh)
+        state  = shard_state(base, mesh)
+        print(f"  mesh {n_x}x{n_y} ...", flush=True)
+        wall, _ = timed(lambda: sharded_run(state, grid_s, params, N_STEPS, mesh))
+        rows.append((n_x, n_y, wall))
+
+    cells = NX * NY * NZ
+    wall1 = rows[0][2]
+    print()
+    print(f"{'Mesh':<8}  {'Devices':>7}  {'Local block':>12}  {'Wall (s)':>9}  "
+          f"{'Mcell-steps/s':>13}  {'Speedup':>8}  {'Efficiency':>10}")
+    print("-" * 80)
+    for n_x, n_y, wall in rows:
+        n = n_x * n_y
+        print(f"{f'{n_x}x{n_y}':<8}  {n:7d}  {f'{NX//n_x}x{NY//n_y}':>12}  "
+              f"{wall:9.3f}  {cells * N_STEPS / wall / 1e6:13.2f}  "
+              f"{wall1 / wall:7.2f}x  {wall1 / wall / n:9.0%}")
+    if jax.devices()[0].platform == "cpu" and n_devices > 1:
+        print("\nNote: CPU devices share the same cores; speed-up is only "
+              "meaningful on separate GPUs.")
+    print("\nDone.")
+
+
 if __name__ == "__main__":
-    main()
+    main_domain() if DOMAIN_MODE else main()

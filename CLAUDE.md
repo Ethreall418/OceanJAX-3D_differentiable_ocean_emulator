@@ -1,7 +1,7 @@
 # CLAUDE.md — OceanJAX 项目记忆
 
 本文件是跨会话（本地 / cloud session）共享的项目记忆。**每次会话结束前按第 9 节更新并推送。**
-最后更新：2026-09-28（本地会话），对应提交 `22c9e50` 之后。
+最后更新：2026-09-29（cloud 会话），并行计算阶段 A 提交（分支 `parallel-phase-a`，`22c9e50` / `170c6a6` 之后）。
 
 ---
 
@@ -34,7 +34,11 @@ OceanJAX：用 JAX 写的三维可微分海洋模式（Boussinesq 静力原始�
 - **Cloud session 注意**：ORAS5 数据（`OceanJAX/data/data_oras5/*.nc`，约 3.5 GB）**不在仓库里**。
   因此 cloud 上：单元测试可跑（`test_oras5` / `test_monthly_forcing` 用合成数据）；
   `verification_experiments/*` 和 `experiment.py` 的 ORAS5 模式**跑不了**（缺数据）。
-- 跑测试：`python -m pytest OceanJAX/tests -q`（当前 174 passed, 1 skipped，约 90 s）。
+- Cloud 环境（2026-09-29）：Python 3.11、JAX 0.10.2、equinox 0.13.8，4 核 CPU，无 GPU。
+  依赖需自己装：`pip install --ignore-installed packaging -r requirements.txt`（Debian 自带的 packaging 无法卸载）。
+- 跑测试：`python -m pytest OceanJAX/tests -q`（当前 198 passed, 0 skipped；cloud 4 核约 5.5 min）。
+  `tests/conftest.py` 设置 `XLA_FLAGS=--xla_force_host_platform_device_count=8`（8 个模拟 CPU 设备），
+  单设备代码不受影响；`test_sharding.py` 需要这 8 个设备。
 - 本地 `git stash@{0}`：旧的 OBC 半成品（`dynamics.py`/`tracers.py` 改动）；`OceanJAX/Physics/obc.py` 未跟踪。**这两者都只在本地，不在 GitHub。**
 - `OceanJAX/data/data_oras5/vomecrty_…_3D_202601_…nc` 单独文件已损坏（非本会话造成）；合并文件 `oras5_2026_01_native_merged.nc` 完好，模式只读合并文件。
 
@@ -55,10 +59,14 @@ OceanJAX/
 │   ├── forcing.py          make_forcing_sequence、make_synthetic_forcing
 │   └── monthly_forcing.py  MonthlyForcing：按日历切换月份强迫
 ├── ml/closure.py    AbstractClosure / NullClosure / ClosureOutput（dT、dS、kappa_v_scale）
-├── parallel/        ensemble.py（vmap 集合 + NamedSharding）；halo.py、sharding.py 为空占位
-└── tests/           9 个测试文件
+├── parallel/        ensemble.py（vmap 集合 + NamedSharding）；
+│                    sharding.py（区域分解阶段 A：make_mesh、shard_grid/state/forcing、sharded_run、
+│                    gather_to_host、init_distributed）；halo.py 为空占位（阶段 B）
+└── tests/           10 个测试文件 + conftest.py（8 模拟设备）
 experiment.py        实验主程序（CONFIG 区：NU_H="munk"、VERTICAL_MIXING="pp81"、FORCING_DIR、START_DATE…）
 verification_experiments/  论文第 5 章验证实验（5.1.1–5.2.3 + extra_atlantic_180d）
+runtime_test/benchmark_parallel.py  集合模式 / `domain` 区域分解模式 benchmark
+docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多节点示例
 ```
 
 ## 5. 关键设计约定（改代码前必读）
@@ -82,6 +90,13 @@ verification_experiments/  论文第 5 章验证实验（5.1.1–5.2.3 + extra_a
 - 多月强迫：`MonthlyForcing(dir, grid, start_date, interp="linear")`，月中为节点线性插值；
   缺月份 → 其他年同月 → 最近月份（目前只有 2026-01 → 永久一月）。只需下载 4 个 2D 文件/月。
 - 时间步：动量与 η 为 leapfrog + Asselin（α=0.1），首步 1·dt；温盐 AB3（首两步 AB1/AB2）。
+- **并行 / 区域分解（阶段 A）**：mesh 轴 ("batch","x","y")；凡是含 (Nx, Ny) 轴对的数组按 x/y 分片，其余复制；
+  GSPMD 把 roll/移位 concatenate 编译成单格 halo 的 collective-permute。
+  **不要把 x、y 两个轴 reshape 合并**（如 `reshape(Nx*Ny, Nz)`）——会触发整场 all-gather；
+  逐列求解用 `mixing._vmap_columns`（嵌套 vmap）。z 轴永远不分片（列运算本地）。
+  `sharded_run` 用 eqx.filter_jit，params 的 Python 浮点先转 0 维数组（`_traced_params`），否则常量折叠改变舍入。
+  1×1 mesh 与 `jax.jit(run)` 逐位一致；多设备约 1 ulp/运算差异（XLA 融合不同），均匀静止态仍严格不变。
+  整格计算量（如 `munk_viscosity`）在分片前的主机网格上算。
 
 ## 6. step() 顺序
 
@@ -103,6 +118,16 @@ verification_experiments/  论文第 5 章验证实验（5.1.1–5.2.3 + extra_a
 
 论文第 5 章：5.1.1、5.1.2 判定方法已改；5.2 节数值与"降温与热通量一致"的解释需按新结果重写。
 
+并行阶段 A 验证（2026-09-29，8 个模拟 CPU 设备，`test_sharding.py`）：
+- 1×1 mesh 与单设备逐位一致；2×4 / 4×2 / 8×1 / 1×4 与单设备差 ≤ 约 1 ulp 量级（40 步，含地形、陆地、东西墙、PP81、底摩擦、强迫）。
+- 静止均匀态分片后严格守恒；集合×区域（batch=2, 2×2）与 batch_run 一致；梯度与单设备一致（rtol 1e-4）。
+- 编译后 HLO：无 all-gather / all-to-all，只有 halo 大小的 collective-permute 和一个单行 all-reduce；
+  隐式垂直求解分片后**零通信**（旧 reshape 版本会 all-gather 整个 y 轴）。
+- experiment.py（rest 模式、2 天）2×3 分解与单设备差 ≤ 2e-8。
+- **发现：PP81 在 N²=0 处不连续**（剪切混合 ↔ 对流 0.1），N²≈0 时 1 ulp 差异可翻转分支，
+  集合成员加 0.05 °C 网格尺度随机扰动时 2 天后差到 u ~3e-3、T ~4e-4；constant 混合时仅 ~1e-6。
+  这是闭合本身对舍入敏感（CPU vs GPU 同样会出现），不是分片 bug；对伴随梯度也有影响。
+
 ## 8. 已知问题与待办
 
 - **表层热点**：固定热通量无 SST 反馈，停滞副热带格点 2 年后 > 40 °C。方案：Haney 恢复项
@@ -112,12 +137,12 @@ verification_experiments/  论文第 5 章验证实验（5.1.1–5.2.3 + extra_a
 - 可变分辨率下 ν_h 应随空间变化（目前全域取最大值）。
 - 中高纬混合层：以后考虑 KPP。
 - OBC：新分支计划（模型完善后再做），半成品在本地 stash。
-- **并行计算（下一大任务，方案待用户确认）**：目标多 GPU 集群，本地只有单 GPU。
-  阶段 A：`parallel/sharding.py` 用 GSPMD 自动分片（mesh 轴 batch/x/y，`shard_grid/state/forcing`、`sharded_run`）；
-  Thomas 求解改为嵌套 vmap（避免 reshape 触发 all-gather）；在 8 个模拟 CPU 设备
-  （`XLA_FLAGS=--xla_force_host_platform_device_count=8`，conftest 设置）上测正确性与"无全场 all-gather"；
-  benchmark 加区域分解模式；experiment.py 加 N_DEVICES_X/Y；`init_distributed()` + SLURM 文档（本地不可测）。
-  阶段 B（shard_map + halo 交换）仅在集群实测效率不足时再做。
+- **并行计算**：阶段 A **已完成**（2026-09-29，见第 5、7 节与 `docs/parallel.md`）。
+  待办：在真实多 GPU / 多节点集群上实测（`init_distributed` + SLURM 路径尚未实测）与 benchmark 效率；
+  阶段 B（shard_map + 显式 halo 交换，`parallel/halo.py`）仅在集群实测效率不足时再做。
+  experiment.py：`N_DEVICES_X/Y` > 1 时走 `sharded_run`，只有进程 0 打印和写 NetCDF。
+- PP81 在 N²=0 处的不连续开关对舍入敏感（见第 7 节）；是否平滑化（如对 N² 做连续过渡）**待用户决定**。
+- `runtime_test/benchmark_parallel.py` 集合模式里 `batch_run` 未 jit，每次重新 trace，计时偏慢（旧问题，未改）。
 
 ## 9. 会话结束前（每次）
 
