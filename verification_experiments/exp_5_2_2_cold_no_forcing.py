@@ -97,7 +97,7 @@ print(f"  S_wet=[{S0_np[wet].min():.2f}, {S0_np[wet].max():.2f}] psu")
 print(f"  SST_mean_0 = {SST0:.3f} °C")
 print("  Forcing: NONE")
 
-params  = ModelParams(nu_h=NU_H, dt=DT)
+params  = ModelParams(nu_h=NU_H, dt=DT, vertical_mixing="pp81")
 run_jit = jax.jit(run, static_argnames=("n_steps", "save_history"))
 
 # ---------------------------------------------------------------------------

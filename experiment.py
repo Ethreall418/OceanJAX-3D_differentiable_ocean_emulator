@@ -40,7 +40,9 @@ NU_H = "munk"
 #   "constant" — nu_v = 1e-4, kappa_v = 1e-5 m2/s everywhere
 #   "pp81"     — Pacanowski & Philander (1981) Richardson-number mixing for
 #                momentum and tracers, with convective adjustment (0.1 m2/s
-#                where statically unstable); constants above as backgrounds
+#                where statically unstable, blended in continuously over
+#                -1e-6 < N2 < 0 s-2); constants above as backgrounds.
+#                ModelParams default.
 VERTICAL_MIXING = "pp81"
 
 # --- Initial conditions -------------------------------------------------------

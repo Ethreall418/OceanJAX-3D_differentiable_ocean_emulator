@@ -215,7 +215,8 @@ class TestStateConsistency:
         """
         grid   = flat_grid
         # Use zero diffusion/viscosity to isolate the surface forcing signal
-        params = ModelParams(kappa_v=0.0, nu_v=0.0)
+        # (constant scheme: under PP81 kappa_v is only the background)
+        params = ModelParams(kappa_v=0.0, nu_v=0.0, vertical_mixing="constant")
 
         forcing = SurfaceForcing(
             heat_flux=jnp.full((grid.Nx, grid.Ny), 200.0),   # 200 W m-2 into ocean

@@ -145,7 +145,7 @@ def _make_forcing(n_steps: int) -> SurfaceForcing:
     )
 
 
-params  = ModelParams(nu_h=NU_H, dt=DT)
+params  = ModelParams(nu_h=NU_H, dt=DT, vertical_mixing="pp81")
 run_jit = jax.jit(run, static_argnames=("n_steps", "save_history"))
 
 # ---------------------------------------------------------------------------

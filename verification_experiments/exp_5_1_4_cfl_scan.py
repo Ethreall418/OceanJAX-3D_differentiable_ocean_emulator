@@ -126,7 +126,7 @@ for dt in DT_LIST:
     total_steps   = N_DAYS * steps_per_day
     cfl_est       = C_BT * dt / dx_min
 
-    params = ModelParams(nu_h=NU_H, dt=float(dt))
+    params = ModelParams(nu_h=NU_H, dt=float(dt), vertical_mixing="pp81")
 
     # Tile forcing to total_steps
     def _tile(arr, n):

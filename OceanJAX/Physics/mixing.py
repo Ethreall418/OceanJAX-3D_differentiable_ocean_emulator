@@ -618,6 +618,17 @@ def buoyancy_and_shear(
 
       N²[k] = (g / rho0) * (rho[k] - rho[k-1]) / dz_w[k]      (> 0 stable)
 
+    For the linear equation of state (``dynamics.equation_of_state``)
+    rho[k] - rho[k-1] = rho0 * (-alpha_T dT + beta_S dS) exactly, so N² is
+    evaluated as
+
+      N²[k] = g * (-alpha_T (T[k] - T[k-1]) + beta_S (S[k] - S[k-1])) / dz_w[k]
+
+    Differencing T and S directly avoids subtracting two ~1025 kg m⁻³
+    densities in float32, which leaves a round-off noise of ~1e-8 s⁻² in N²
+    (at dz = 50 m); here it is ~1e-10 s⁻².  This must be revisited if the
+    equation of state becomes nonlinear.
+
     Shear is formed where u and v live, squared, and averaged onto the
     tracer column over its wet neighbouring faces, so that N² and S² sit at
     the same point:
@@ -628,11 +639,9 @@ def buoyancy_and_shear(
     by the zero velocity of land faces.  Surface, seafloor and dry faces
     are zero.
     """
-    from OceanJAX.Physics.dynamics import equation_of_state  # deferred
-
     safe_dz_w = jnp.where(grid.dz_w > 0, grid.dz_w, 1.0)
-    rho = equation_of_state(T, S, params)
-    n2  = (params.g / params.rho0) * _diff_w(rho) / safe_dz_w * grid.mask_w
+    db  = params.g * (params.beta_S * _diff_w(S) - params.alpha_T * _diff_w(T))
+    n2  = db / safe_dz_w * grid.mask_w
 
     mu = _face_mask(grid.mask_u)
     mv = _face_mask(grid.mask_v)
@@ -682,14 +691,32 @@ def pp81_coefficients(
 
     For a stably stratified face (N² >= 0), with Ri = N² / S²:
 
-      nu    = nu0 / (1 + alpha Ri)^n            + nu_b
-      kappa = nu0 / (1 + alpha Ri)^(n+1)        + kappa_b
+      nu_pp    = nu0 / (1 + alpha Ri)^n            + nu_b
+      kappa_pp = nu0 / (1 + alpha Ri)^(n+1)        + kappa_b
 
-    and for a statically unstable face (N² < 0) both take the convective
-    value ``params.vmix_convective`` (convective adjustment; stable for any
-    value because vertical mixing is implicit).  Parameters come from
-    ModelParams: pp81_nu0, pp81_alpha, pp81_n, vmix_convective, with the
-    constant-mixing values nu_v / kappa_v as backgrounds nu_b / kappa_b.
+    Statically unstable faces (N² < 0) get convective adjustment, blended
+    in continuously over  -N²_c <= N² <= 0  (N²_c = ``params.vmix_n2_ramp``):
+
+      x = clip(-N² / N²_c, 0, 1),   w = x² (3 - 2x)        (smoothstep)
+      nu    = (1 - w) nu_pp(Ri=0)    + w nu_conv
+      kappa = (1 - w) kappa_pp(Ri=0) + w nu_conv
+
+    so nu and kappa are continuous with a continuous derivative in N².
+    A hard switch at N² = 0 (the original PP81 convective adjustment) jumps
+    from nu0 + nu_b to nu_conv, and round-off in N² of a nearly neutral
+    column then flips the branch and changes the mixing by O(0.1 m² s⁻¹).
+    Stable faces (w = 0) are unaffected; below -N²_c the full convective
+    value applies (stable for any value because vertical mixing is
+    implicit).  vmix_n2_ramp = 0 recovers the hard switch.
+
+    On the stable side PP81 itself is steep when there is no shear:
+    Ri = N² / max(S², 1e-12) is 0/0 at N² = S² = 0, so kappa falls from
+    nu0 + kappa_b to the background within N² ~ 1e-11 s⁻².  That is the
+    closure's own Ri dependence and is left unchanged.
+
+    Parameters come from ModelParams: pp81_nu0, pp81_alpha, pp81_n,
+    vmix_convective, vmix_n2_ramp, with the constant-mixing values
+    nu_v / kappa_v as backgrounds nu_b / kappa_b.
 
     PP81 is a local shear/stratification closure for the stratified
     interior (designed for the tropical ocean).  It has no surface
@@ -708,10 +735,16 @@ def pp81_coefficients(
     ri     = jnp.where(stable, n2 / jnp.maximum(s2, _S2_FLOOR), 0.0)
     f      = 1.0 / (1.0 + params.pp81_alpha * ri)
     shear  = params.pp81_nu0 * f ** params.pp81_n
+    nu_pp    = shear + params.nu_v
+    kappa_pp = shear * f + params.kappa_v
 
-    conv  = params.vmix_convective
-    nu    = jnp.where(stable, shear + params.nu_v, conv) * grid.mask_w
-    kappa = jnp.where(stable, shear * f + params.kappa_v, conv) * grid.mask_w
+    # Convective weight: 0 for N² >= 0, smoothstep up to 1 at N² = -N²_c.
+    # The floor on the ramp width turns vmix_n2_ramp = 0 into a hard switch.
+    x    = jnp.clip(-n2 / jnp.maximum(params.vmix_n2_ramp, 1e-30), 0.0, 1.0)
+    w    = x * x * (3.0 - 2.0 * x)
+    conv = params.vmix_convective
+    nu    = ((1.0 - w) * nu_pp    + w * conv) * grid.mask_w
+    kappa = ((1.0 - w) * kappa_pp + w * conv) * grid.mask_w
 
     # Viscosity at u / v columns: mean of the adjacent tracer columns over
     # their wet faces (the velocity solver applies its own face mask).

@@ -81,7 +81,7 @@ OceanJAX/
 ├── Physics/
 │   ├── dynamics.py         # EOS, hydrostatic pressure, PGF, Coriolis, free surface
 │   ├── tracers.py          # tracer advection/diffusion, surface T/S forcing
-│   └── mixing.py           # implicit vertical mixing/viscosity, Ri-based diffusivity
+│   └── mixing.py           # implicit vertical mixing/viscosity, PP81 Ri-based mixing
 ├── data/
 │   ├── oras5.py            # ORAS5 loader: read_oras5, regrid_to_model,
 │   │                       #   read_oras5_forcing, regrid_forcing
@@ -230,9 +230,10 @@ from OceanJAX.state import ModelParams
 params = ModelParams(
     dt      = 300.0,    # time step [s]  — keep <= 900 s (see Section 11)
     kappa_h = 100.0,    # horizontal tracer diffusivity [m^2/s]
-    kappa_v = 1e-5,     # vertical tracer diffusivity [m^2/s]
+    kappa_v = 1e-5,     # background vertical tracer diffusivity [m^2/s]
     nu_h    = 200.0,    # horizontal viscosity [m^2/s]
-    nu_v    = 1e-4,     # vertical viscosity [m^2/s]
+    nu_v    = 1e-4,     # background vertical viscosity [m^2/s]
+    vertical_mixing = "pp81",   # default; "constant" uses kappa_v / nu_v only
     # All other parameters have physically validated defaults (see Section 12).
 )
 ```
@@ -699,8 +700,12 @@ where  c_bt    = sqrt(g * H_max)    barotropic wave speed [m/s]
 | `T_ref` | 10.0 | C | EOS reference temperature |
 | `S_ref` | 35.0 | psu | EOS reference salinity |
 | `nu_h` | 200.0 | m^2/s | Horizontal viscosity |
-| `nu_v` | 1e-4 | m^2/s | Vertical viscosity |
+| `nu_v` | 1e-4 | m^2/s | Vertical viscosity (PP81 background) |
 | `kappa_h` | 100.0 | m^2/s | Horizontal tracer diffusivity |
-| `kappa_v` | 1e-5 | m^2/s | Vertical tracer diffusivity |
+| `kappa_v` | 1e-5 | m^2/s | Vertical tracer diffusivity (PP81 background) |
+| `vertical_mixing` | "pp81" | — | "pp81" (Richardson-number mixing + convection) or "constant" |
+| `pp81_nu0`, `pp81_alpha`, `pp81_n` | 1e-2, 5, 2 | m^2/s, —, — | PP81 shear-mixing amplitude, Ri coefficient, exponent |
+| `vmix_convective` | 0.1 | m^2/s | Convective nu = kappa where statically unstable |
+| `vmix_n2_ramp` | 1e-6 | s^-2 | N² width of the continuous blend into convection (0 = hard switch) |
 | `asselin_coeff` | 0.1 | — | Asselin-Robert filter coefficient |
 | `ab3_coeffs` | (23/12, -16/12, 5/12) | — | Adams-Bashforth 3 coefficients |
