@@ -89,7 +89,8 @@ OceanJAX/
 ├── ml/
 │   └── closure.py          # AbstractClosure, NullClosure, ClosureOutput
 ├── parallel/
-│   └── ensemble.py         # batch_run, sharded_ensemble_run
+│   ├── ensemble.py         # batch_run, sharded_ensemble_run
+│   └── sharding.py         # domain decomposition: make_mesh, shard_*, sharded_run
 └── tests/                  # pytest test suite
 
 experiment.py               # Full experiment driver (NetCDF output, diagnostics)
@@ -607,6 +608,22 @@ T_mean = jnp.mean(final_batch.T, axis=0)
 T_std  = jnp.std( final_batch.T, axis=0)
 ```
 
+### Domain decomposition (one domain over several devices)
+
+```python
+from OceanJAX.parallel.sharding import make_mesh, shard_grid, shard_state, sharded_run
+
+mesh   = make_mesh(n_x=4, n_y=2)            # Nx % 4 == 0, Ny % 2 == 0
+grid_s = shard_grid(grid, mesh)
+state  = shard_state(state, mesh)
+final, _ = sharded_run(state, grid_s, params, N_STEPS, mesh,
+                       forcing_sequence=forcing)
+```
+
+In `experiment.py` set `N_DEVICES_X` / `N_DEVICES_Y`.  See
+[docs/parallel.md](docs/parallel.md) for how it works, numerical agreement,
+and running on a multi-node SLURM cluster.
+
 ---
 
 ## 10. Running Verification Tests
@@ -623,6 +640,7 @@ python -m pytest OceanJAX/tests/test_closure.py      -v
 python -m pytest OceanJAX/tests/test_forcing.py      -v
 python -m pytest OceanJAX/tests/test_oras5.py        -v
 python -m pytest OceanJAX/tests/test_parallel.py     -v
+python -m pytest OceanJAX/tests/test_sharding.py     -v   # 8 simulated CPU devices
 
 # Verification experiments (Chapter 5)
 python verification_experiments/exp_5_1_1_rest_conservation.py

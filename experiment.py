@@ -112,6 +112,23 @@ TAU_Y     = 0.0
 N_ENSEMBLE        = 1      # number of ensemble members (1 = single run)
 ENSEMBLE_PERTURB_T = 0.0   # Gaussian T perturbation std [°C] for each member
 
+# --- Domain decomposition -----------------------------------------------------
+#
+# N_DEVICES_X x N_DEVICES_Y > 1 splits the domain over that many devices
+# (OceanJAX.parallel.sharding; XLA inserts the halo exchanges).  Requires
+# NX % N_DEVICES_X == 0 and NY % N_DEVICES_Y == 0.  1 x 1 = off.
+#
+# Combined with N_ENSEMBLE > 1, members are also spread over the remaining
+# devices: batch axis = largest divisor of N_ENSEMBLE that fits in
+# n_devices // (N_DEVICES_X * N_DEVICES_Y).
+#
+# On a cluster, start one process per GPU (or node) with srun; the SLURM
+# environment is picked up automatically (see docs/parallel.md).  Only
+# process 0 prints and writes the NetCDF output.
+
+N_DEVICES_X = 1
+N_DEVICES_Y = 1
+
 # --- Output -------------------------------------------------------------------
 OUTPUT_NC     = "output_cold_full_forcing.nc"
 SAVE_INTERVAL = 288   # steps between NetCDF snapshots  (288 × 300 s = 1 day)
@@ -416,13 +433,38 @@ def _diag_line(state, sim_day: float, steps_done: int, wall: float, grid) -> boo
 # Main
 # ---------------------------------------------------------------------------
 
+def _make_domain_mesh(n_devices: int):
+    """("batch", "x", "y") mesh for N_DEVICES_X x N_DEVICES_Y (+ ensemble)."""
+    from OceanJAX.parallel.sharding import make_mesh
+
+    n_domain = N_DEVICES_X * N_DEVICES_Y
+    if n_domain > n_devices:
+        print(f"ERROR: N_DEVICES_X * N_DEVICES_Y = {n_domain} but only "
+              f"{n_devices} devices available.", file=sys.stderr)
+        sys.exit(1)
+    n_batch = 1
+    if N_ENSEMBLE > 1:
+        n_batch = max(d for d in range(1, n_devices // n_domain + 1)
+                      if N_ENSEMBLE % d == 0)
+    return make_mesh(N_DEVICES_X, N_DEVICES_Y, n_batch=n_batch)
+
+
 def main() -> None:
+    import os
     from OceanJAX.state import ModelParams
     from OceanJAX.timeStepping import run as ocean_run
+    from OceanJAX.parallel.sharding import init_distributed, gather_to_host
 
-    n_steps   = round(N_DAYS * 86400 / DT)
-    ensemble  = N_ENSEMBLE > 1
-    n_devices = len(jax.devices())
+    # Multi-process (SLURM) setup; a no-op for an ordinary single process.
+    init_distributed()
+    is_main = jax.process_index() == 0
+    if not is_main:
+        sys.stdout = open(os.devnull, "w")
+
+    n_steps    = round(N_DAYS * 86400 / DT)
+    ensemble   = N_ENSEMBLE > 1
+    n_devices  = len(jax.devices())
+    decomposed = N_DEVICES_X * N_DEVICES_Y > 1
 
     print("=" * 62)
     print(f"OceanJAX experiment")
@@ -433,6 +475,9 @@ def main() -> None:
         print(f"  ensemble  : {N_ENSEMBLE} members  "
               f"perturb_T={ENSEMBLE_PERTURB_T} °C  "
               f"devices={n_devices}")
+    if decomposed:
+        print(f"  domain    : split over {N_DEVICES_X} x {N_DEVICES_Y} devices "
+              f"({jax.process_count()} process(es), {n_devices} devices)")
     print(f"  output    : {OUTPUT_NC}  save_every={SAVE_INTERVAL} steps")
     print("=" * 62)
 
@@ -455,7 +500,21 @@ def main() -> None:
         state = base_state
 
     # Compile run function
-    if ensemble:
+    if decomposed:
+        from OceanJAX.parallel.sharding import (
+            shard_grid, shard_state, sharded_run)
+        mesh   = _make_domain_mesh(n_devices)
+        grid_s = shard_grid(grid, mesh)          # placed once, reused by every chunk
+        state  = shard_state(state, mesh)
+        print(f"  mesh      : batch={mesh.shape['batch']} x={mesh.shape['x']} "
+              f"y={mesh.shape['y']}  local block "
+              f"{NX // N_DEVICES_X}x{NY // N_DEVICES_Y}x{NZ}")
+
+        def _run_chunk(s, chunk, forcing):
+            # One forcing sequence (chunk, NX, NY) is shared by all members.
+            return sharded_run(s, grid_s, params, chunk, mesh,
+                               forcing_sequence=forcing, save_history=False)
+    elif ensemble:
         from OceanJAX.parallel.ensemble import sharded_ensemble_run
         # sharded_ensemble_run handles jit internally
         def _run_chunk(s, chunk, forcing):
@@ -469,11 +528,20 @@ def main() -> None:
             return run_jit(s, grid, params, n_steps=chunk,
                            forcing_sequence=forcing, save_history=False)
 
-    # Open output file and save t=0
-    ds = _create_nc(OUTPUT_NC, grid)
-    ds.nu_h = params.nu_h
-    ds.vertical_mixing = params.vertical_mixing
-    _write_snapshot(ds, state)
+    # Host copy of the (possibly sharded) state for output and diagnostics
+    to_host = gather_to_host if decomposed else (lambda s: s)
+
+    # Open output file and save t=0 (process 0 only)
+    ds = None
+    if is_main:
+        ds = _create_nc(OUTPUT_NC, grid)
+        ds.nu_h = params.nu_h
+        ds.vertical_mixing = params.vertical_mixing
+        ds.n_devices_x = N_DEVICES_X
+        ds.n_devices_y = N_DEVICES_Y
+    host_state = to_host(state)
+    if is_main:
+        _write_snapshot(ds, host_state)
     print(f"\nOutput: {OUTPUT_NC}  (t=0 saved)\n")
 
     if ensemble:
@@ -505,14 +573,16 @@ def main() -> None:
             wall = _time.perf_counter() - t0
 
             steps_done += chunk
+            host_state = to_host(state)
             # For ensemble, each member has its own time scalar; use member 0.
-            sim_day = float(state.time) / 86400.0 if state.time.ndim == 0 \
-                      else float(state.time[0])   / 86400.0
+            sim_day = float(host_state.time) / 86400.0 if host_state.time.ndim == 0 \
+                      else float(host_state.time[0])   / 86400.0
 
-            bad = _diag_line(state, sim_day, steps_done, wall, grid)
+            bad = _diag_line(host_state, sim_day, steps_done, wall, grid)
 
             if steps_done == next_save_step:
-                _write_snapshot(ds, state)
+                if is_main:
+                    _write_snapshot(ds, host_state)
                 next_save_step += SAVE_INTERVAL
 
             if bad:
@@ -521,7 +591,8 @@ def main() -> None:
                 break
 
     finally:
-        ds.close()
+        if ds is not None:
+            ds.close()
 
     print("-" * 90)
     label = f"stable for {N_DAYS} days" if all_ok else "model blew up"
