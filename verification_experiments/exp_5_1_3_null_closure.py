@@ -79,7 +79,7 @@ with warnings.catch_warnings():
     # Horizontal eddy viscosity from the Munk criterion for this grid
     NU_H = munk_viscosity(grid)
     print(f"  nu_h = {NU_H:.3g} m2/s (Munk criterion)")
-    params = ModelParams(nu_h=NU_H, dt=DT)
+    params = ModelParams(nu_h=NU_H, dt=DT, vertical_mixing="pp81")
     state = regrid_to_model(raw, grid)
 
 # Zero out velocities and eta (oras5_cold mode)

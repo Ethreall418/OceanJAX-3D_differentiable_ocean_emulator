@@ -231,6 +231,29 @@ class TestCorrectness:
         for name in ("u", "v", "w", "eta"):
             assert np.all(np.asarray(getattr(final, name)) == 0.0), name
 
+    def test_pp81_near_neutral_insensitive_to_roundoff(self):
+        """
+        Nearly neutral column (uniform T + 0.05 K noise, surface cooling,
+        wind): the ~1 ulp differences of the partitioned programme must not
+        be amplified by PP81.  With the old hard convective switch at N² = 0
+        (vmix_n2_ramp = 0) u differs by ~1.5e-5 after 144 steps; with the
+        continuous blend by ~1e-6.
+        """
+        nx, ny, nz, n = 16, 12, 8, 144
+        g = OceanGrid.create((-40.0, -10.0), (-10.0, 15.0),
+                             (np.arange(nz) + 0.5) * 25.0, nx, ny)
+        rng = np.random.default_rng(5)
+        st = create_rest_state(g, 10.0, 35.0)
+        noise = jnp.asarray(rng.normal(0.0, 0.05, st.T.shape), jnp.float32)
+        st = eqx.tree_at(lambda s: s.T, st, (st.T + noise) * g.mask_c)
+        f = SurfaceForcing(jnp.full((n, nx, ny), -50.0), jnp.zeros((n, nx, ny)),
+                           jnp.full((n, nx, ny), 0.05), jnp.zeros((n, nx, ny)))
+        p = ModelParams(dt=600.0, nu_h=2e4, vertical_mixing="pp81")
+        ref, _ = jax.jit(run, static_argnums=(3,))(st, g, p, n, f)
+        out, _ = sharded_run(st, g, p, n, make_mesh(2, 4), forcing_sequence=f)
+        assert _max_abs_diff(out, ref, "u") < 3e-6
+        assert _max_abs_diff(out, ref, "T") < 1e-5
+
     def test_chunks_reuse_sharded_state(self, state, grid, params, reference, forcing):
         """Two chunks of N/2 steps, feeding the sharded state back in."""
         mesh = make_mesh(2, 4)

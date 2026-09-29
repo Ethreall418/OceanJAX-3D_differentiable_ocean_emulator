@@ -36,6 +36,7 @@ Running
 from __future__ import annotations
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 import equinox as eqx
 import pytest
@@ -176,6 +177,8 @@ class TestBottomDrag:
 # ---------------------------------------------------------------------------
 
 class TestFreezingLimit:
+    # Constant mixing with kappa_v = 0 isolates the limiter: under PP81 the
+    # cold-over-warm column would convect.
 
     @staticmethod
     def _cold_state(grid):
@@ -184,7 +187,8 @@ class TestFreezingLimit:
 
     def test_clamped_to_freezing_point(self):
         grid   = OceanGrid.create((0.0, 20.0), (50.0, 60.0), np.array([10.0, 30.0]), 3, 3)
-        params = ModelParams(dt=300.0, kappa_v=0.0, kappa_h=0.0)
+        params = ModelParams(dt=300.0, kappa_v=0.0, kappa_h=0.0,
+                             vertical_mixing="constant")
         new    = step(self._cold_state(grid), grid, params)
         T, S   = np.asarray(new.T), np.asarray(new.S)
         np.testing.assert_allclose(T[:, :, 0], -0.0575 * S[:, :, 0], rtol=1e-6)
@@ -192,7 +196,8 @@ class TestFreezingLimit:
 
     def test_disabled(self):
         grid   = OceanGrid.create((0.0, 20.0), (50.0, 60.0), np.array([10.0, 30.0]), 3, 3)
-        params = ModelParams(dt=300.0, kappa_v=0.0, kappa_h=0.0, limit_freezing=False)
+        params = ModelParams(dt=300.0, kappa_v=0.0, kappa_h=0.0, limit_freezing=False,
+                             vertical_mixing="constant")
         new    = step(self._cold_state(grid), grid, params)
         np.testing.assert_array_equal(np.asarray(new.T)[:, :, 0], -5.0)
 
@@ -263,8 +268,8 @@ class TestPP81:
         T, S, u, v = _column_fields(grid, dTdz=-0.05, dudz=0.0)
         n2, _ = buoyancy_and_shear(T, S, u, v, grid, self.PARAMS)
         expected = self.PARAMS.g * self.PARAMS.alpha_T * 0.05       # -g α dT/dz
-        # float32 densities ~1025 kg m-3 limit N² to ~4e-4 relative accuracy
-        np.testing.assert_allclose(np.asarray(n2)[:, :, 1:-1], expected, rtol=1e-3)
+        # N² from T/S differences: float32 round-off only (no ~1025 cancellation)
+        np.testing.assert_allclose(np.asarray(n2)[:, :, 1:-1], expected, rtol=1e-5)
 
     def test_background_without_shear(self):
         from OceanJAX.Physics.mixing import pp81_coefficients
@@ -314,7 +319,7 @@ class TestPP81:
         T, S, u, v = _column_fields(grid, dTdz=-0.05, dudz=0.02)
         from OceanJAX.state import create_from_arrays
         st = create_from_arrays(grid, u=u, v=v, T=T, S=S, eta=jnp.zeros((4, 4)))
-        a = step(st, grid, ModelParams(dt=300.0))
+        a = step(st, grid, ModelParams(dt=300.0, vertical_mixing="constant"))
         b = step(st, grid, ModelParams(dt=300.0, vertical_mixing="pp81", pp81_nu0=0.0))
         for f in ("u", "v", "T", "S", "eta"):
             np.testing.assert_allclose(np.asarray(getattr(a, f)),
@@ -332,10 +337,161 @@ class TestPP81:
             return np.asarray(final.T)[0, 0, :]
 
         mixed = run_day(ModelParams(dt=300.0, vertical_mixing="pp81"))
-        const = run_day(ModelParams(dt=300.0))
+        const = run_day(ModelParams(dt=300.0, vertical_mixing="constant"))
         assert np.ptp(mixed) < 0.01 * np.ptp(np.asarray(T)[0, 0, :])
         assert np.all(np.diff(const) > 0), "constant mixing keeps the unstable profile"
 
     def test_invalid_scheme_rejected(self):
         with pytest.raises(ValueError, match="vertical_mixing"):
             ModelParams(vertical_mixing="kpp")
+
+    def test_pp81_is_default(self):
+        assert ModelParams().vertical_mixing == "pp81"
+
+
+# ---------------------------------------------------------------------------
+# 6. PP81 N² accuracy and continuous convective blend
+# ---------------------------------------------------------------------------
+
+def _coefficients_at_n2(n2_values, params, dudz=0.0):
+    """
+    PP81 (kappa, nu) with prescribed N² on single-interior-face columns.
+
+    One column per N² value; T is set so that N² = -g alpha_T dT / dz, and
+    u has the same shear dudz in every column (S² = dudz²).  kappa is
+    column-local; nu is returned at u-points, which averages neighbouring
+    columns, so it is only meaningful when all values are equal (use
+    ``_nu_at_n2``).
+    """
+    from OceanJAX.Physics.mixing import pp81_coefficients
+    n2_values = np.asarray(n2_values, np.float64)
+    n = len(n2_values)
+    z = np.array([10.0, 30.0])                           # one interior face, dz_w = 20 m
+    grid = OceanGrid.create((0.0, float(n)), (10.0, 11.0), z, n, 1)
+    dT = -n2_values * 20.0 / (params.g * params.alpha_T)
+    T = np.stack([np.full(n, 15.0), 15.0 + dT], axis=-1)[:, None, :]
+    sh = (n, 1, 2)
+    u = jnp.asarray(np.broadcast_to(dudz * z, sh), jnp.float32)
+    kappa, nu_u, _ = pp81_coefficients(
+        jnp.asarray(T, jnp.float32), jnp.full(sh, 35.0),
+        u, jnp.zeros(sh), grid, params)
+    return np.asarray(kappa)[:, 0, 1], np.asarray(nu_u)[:, 0, 1]
+
+
+def _nu_at_n2(n2, params, dudz=0.0):
+    """nu at a u-point between two columns with the same N²."""
+    return float(_coefficients_at_n2([n2, n2], params, dudz)[1][0])
+
+
+class TestPP81Continuity:
+
+    P = ModelParams(vertical_mixing="pp81")
+
+    def test_n2_matches_float64_density_difference(self):
+        """N² agrees with a float64 evaluation of (g/rho0) d(rho)/dz."""
+        from OceanJAX.Physics.mixing import buoyancy_and_shear
+        p = self.P
+        grid = _pp81_grid()
+        rng = np.random.default_rng(3)
+        sh = (grid.Nx, grid.Ny, grid.Nz)
+        T = (20.0 - 0.05 * np.asarray(grid.z_c) + rng.normal(0, 0.01, sh)).astype(np.float32)
+        S = (35.0 + rng.normal(0, 0.01, sh)).astype(np.float32)
+        n2, _ = buoyancy_and_shear(jnp.asarray(T), jnp.asarray(S), jnp.zeros(sh),
+                                   jnp.zeros(sh), grid, p)
+        T64, S64 = T.astype(np.float64), S.astype(np.float64)
+        rho = p.rho0 * (1 - p.alpha_T * (T64 - p.T_ref) + p.beta_S * (S64 - p.S_ref))
+        ref = p.g / p.rho0 * np.diff(rho, axis=-1) / 20.0
+        err = np.abs(np.asarray(n2, np.float64)[:, :, 1:-1] - ref).max()
+        assert err < 1e-9, f"N² error {err:.2e} s⁻² (density differencing gives ~1e-8)"
+
+    def test_uniform_column_has_zero_n2(self):
+        from OceanJAX.Physics.mixing import buoyancy_and_shear
+        grid = _pp81_grid()
+        sh = (grid.Nx, grid.Ny, grid.Nz)
+        n2, _ = buoyancy_and_shear(jnp.full(sh, 17.3), jnp.full(sh, 34.7),
+                                   jnp.zeros(sh), jnp.zeros(sh), grid, self.P)
+        assert np.all(np.asarray(n2) == 0.0)
+
+    def test_blend_end_points(self):
+        p = self.P
+        n2c = p.vmix_n2_ramp
+        conv = p.vmix_convective
+        kappa, _ = _coefficients_at_n2([1e-5, 0.0, -0.5 * n2c, -n2c, -10 * n2c], p)
+        # stable, no shear: Ri huge, background value
+        np.testing.assert_allclose(kappa[0], p.kappa_v, rtol=1e-3)
+        # neutral: Ri = 0
+        np.testing.assert_allclose(kappa[1], p.pp81_nu0 + p.kappa_v, rtol=1e-6)
+        # half-way: smoothstep(0.5) = 0.5 (dT ~ 0.005 K on 15 K: float32 N² ~2e-4 rel.)
+        np.testing.assert_allclose(kappa[2], 0.5 * (p.pp81_nu0 + p.kappa_v + conv), rtol=1e-3)
+        np.testing.assert_allclose(kappa[3:], conv, rtol=1e-6)
+        np.testing.assert_allclose(_nu_at_n2(0.0, p), p.pp81_nu0 + p.nu_v, rtol=1e-6)
+        np.testing.assert_allclose(_nu_at_n2(-0.5 * n2c, p),
+                                   0.5 * (p.pp81_nu0 + p.nu_v + conv), rtol=1e-3)
+        np.testing.assert_allclose(_nu_at_n2(-n2c, p), conv, rtol=1e-6)
+
+    def test_continuous_and_monotone_across_zero(self):
+        """
+        With shear present (S² = 1e-4 s⁻², so Ri = N²/S² is well defined
+        around N² = 0) kappa has no jump anywhere: neighbouring samples
+        differ by O(step).
+        """
+        p = self.P
+        n2c = p.vmix_n2_ramp
+        n2 = np.linspace(-1.5 * n2c, 0.5 * n2c, 401)
+        kappa, _ = _coefficients_at_n2(n2, p, dudz=0.01)
+        step = n2[1] - n2[0]
+        # max slope: smoothstep 1.5 / N²_c on the unstable side; PP81 on the
+        # stable side, d(kappa)/dN² = -3 alpha nu0 / S² at Ri = 0
+        slope = max(1.5 * (p.vmix_convective - p.pp81_nu0) / n2c,
+                    3 * p.pp81_alpha * p.pp81_nu0 / 1e-4)
+        assert np.abs(np.diff(kappa)).max() <= 1.05 * slope * step
+        assert np.all(np.diff(kappa) <= 1e-9), "mixing must not increase with N²"
+
+    def test_no_convective_jump_without_shear(self):
+        """
+        Without shear the unstable side is still continuous up to N² = 0.
+        (On the stable side Ri = N²/max(S², 1e-12) rises steeply, so kappa
+        falls to the background within N² ~ 1e-11; that is PP81 itself.)
+        """
+        p = self.P
+        n2 = np.linspace(-1.5 * p.vmix_n2_ramp, 0.0, 301)
+        kappa, _ = _coefficients_at_n2(n2, p)
+        max_jump = 1.5 * (p.vmix_convective - p.pp81_nu0) * (n2[1] - n2[0]) / p.vmix_n2_ramp
+        assert np.abs(np.diff(kappa)).max() <= 1.05 * max_jump
+
+    def test_zero_ramp_recovers_hard_switch(self):
+        p = ModelParams(vertical_mixing="pp81", vmix_n2_ramp=0.0)
+        kappa, _ = _coefficients_at_n2([-1e-9, 0.0], p)
+        np.testing.assert_allclose(kappa[0], p.vmix_convective, rtol=1e-6)
+        np.testing.assert_allclose(kappa[1], p.pp81_nu0 + p.kappa_v, rtol=1e-6)
+
+    def test_stable_faces_bit_identical_to_hard_switch(self):
+        """The blend only touches N² < 0: stable faces match vmix_n2_ramp = 0."""
+        from OceanJAX.Physics.mixing import pp81_coefficients
+        grid = _pp81_grid()
+        T, S, u, v = _column_fields(grid, dTdz=-0.05, dudz=0.01)
+        hard = ModelParams(vertical_mixing="pp81", vmix_n2_ramp=0.0)
+        for a, b in zip(pp81_coefficients(T, S, u, v, grid, self.P),
+                        pp81_coefficients(T, S, u, v, grid, hard)):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_gradient_finite_near_neutral(self):
+        """d(sum kappa)/dT is finite on neutral, blended and convective faces."""
+        from OceanJAX.Physics.mixing import pp81_coefficients
+        p = self.P
+        grid = _pp81_grid()
+        sh = (grid.Nx, grid.Ny, grid.Nz)
+        dz = np.diff(np.asarray(grid.z_c))[0]
+        # warm-below increments spanning 0 .. 2 N²_c
+        dT = np.linspace(0.0, 2.0, grid.Nx)[:, None, None] * p.vmix_n2_ramp * dz / (p.g * p.alpha_T)
+        T0 = jnp.asarray(15.0 + dT * np.arange(grid.Nz)[None, None, :]
+                         * np.ones(sh), jnp.float32)
+
+        def total(T):
+            kappa, _, _ = pp81_coefficients(T, jnp.full(sh, 35.0), jnp.zeros(sh),
+                                            jnp.zeros(sh), grid, p)
+            return jnp.sum(kappa)
+
+        g = np.asarray(jax.grad(total)(T0))
+        assert np.all(np.isfinite(g))
+        assert np.abs(g).max() > 0

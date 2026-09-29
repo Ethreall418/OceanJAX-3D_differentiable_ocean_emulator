@@ -15,6 +15,8 @@ Three groups
   A — kappa_v = 1e-4 m²/s  (baseline, closure=None)
   B — kappa_v = 1e-2 m²/s  (KappaScaleClosure(scale=100), baseline×100)
   C — kappa_v = 0   m²/s   (KappaScaleClosure(scale=0),   no diffusion)
+  All groups use constant vertical mixing: the test checks the kappa_v
+  scaling against the analytic diffusion time scales.
 
 Physics
 -------
@@ -137,7 +139,8 @@ def run_group(label: str, closure) -> dict:
     """
     state  = create_from_arrays(grid, u_init_np, v_init_np,
                                 T_init_np, S_init_np, eta_init_np)
-    params = ModelParams(dt=DT, kappa_v=KAPPA_BASE)
+    # Constant mixing on purpose: this test checks the kappa_v scaling itself.
+    params = ModelParams(dt=DT, kappa_v=KAPPA_BASE, vertical_mixing="constant")
 
     records = []
     bad     = False

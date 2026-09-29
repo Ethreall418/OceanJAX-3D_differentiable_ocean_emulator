@@ -7,6 +7,7 @@ Setup
   - Uniform T = 15.0 °C, S = 35.0 psu everywhere
   - u = v = w = eta = 0
   - No surface forcing
+  - PP81 vertical mixing (uniform column: N² = 0, Ri = 0)
   - Integration: 30 days  (dt = 300 s  →  8640 steps)
 
 Metrics recorded every SAVE_INTERVAL steps
@@ -82,7 +83,7 @@ grid = OceanGrid.create(
     Nx=NX, Ny=NY,
     bathymetry=None,          # flat bottom
 )
-params = ModelParams(dt=DT)
+params = ModelParams(dt=DT, vertical_mixing="pp81")
 state  = create_rest_state(grid, T_background=T_BG, S_background=S_BG)
 
 # ---------------------------------------------------------------------------

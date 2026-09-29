@@ -43,12 +43,15 @@ class ModelParams(eqx.Module):
     # "constant": nu_v / kappa_v everywhere.
     # "pp81"    : Pacanowski & Philander (1981) Ri-dependent mixing with
     #             nu_v / kappa_v as backgrounds, plus convective adjustment
-    #             (vmix_convective where N² < 0).  See mixing.pp81_coefficients.
+    #             (vmix_convective where N² < -vmix_n2_ramp, blended in
+    #             continuously for -vmix_n2_ramp < N² < 0).  Default.
+    #             See mixing.pp81_coefficients.
     vertical_mixing: str = eqx.field(static=True)
     pp81_nu0:        float   # shear-mixing amplitude nu0 [m^2 s-1]
     pp81_alpha:      float   # Ri coefficient alpha [-]
     pp81_n:          float   # exponent n [-]
     vmix_convective: float   # nu = kappa where statically unstable [m^2 s-1]
+    vmix_n2_ramp:    float   # N² width of the convective blend [s-2]; 0 = hard switch
 
     # ---- bottom drag (quadratic, implicit) --------------------------------
     bottom_drag_cd:  float   # drag coefficient Cd [-]; 0 = free-slip bottom
@@ -81,11 +84,12 @@ class ModelParams(eqx.Module):
         nu_v: float = 1e-4,
         kappa_h: float = 100.0,
         kappa_v: float = 1e-5,
-        vertical_mixing: str = "constant",
+        vertical_mixing: str = "pp81",
         pp81_nu0: float = 1e-2,
         pp81_alpha: float = 5.0,
         pp81_n: float = 2.0,
         vmix_convective: float = 0.1,
+        vmix_n2_ramp: float = 1e-6,
         bottom_drag_cd: float = 1e-3,
         bottom_drag_ubg: float = 0.05,
         freezing_slope: float = 0.0575,
@@ -113,6 +117,7 @@ class ModelParams(eqx.Module):
         self.pp81_alpha      = pp81_alpha
         self.pp81_n          = pp81_n
         self.vmix_convective = vmix_convective
+        self.vmix_n2_ramp    = vmix_n2_ramp
         self.bottom_drag_cd  = bottom_drag_cd
         self.bottom_drag_ubg = bottom_drag_ubg
         self.freezing_slope  = freezing_slope

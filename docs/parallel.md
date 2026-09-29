@@ -36,12 +36,18 @@ divisible by `n_batch`.
 - **Larger meshes** agree to round-off, about 1 ulp per operation. XLA
   fuses the partitioned stencils differently, which is the same kind of
   difference as CPU vs GPU. A uniform resting ocean stays exactly uniform.
-- **PP81 caveat.** The PP81 closure switches discontinuously at N² = 0 (shear
-  mixing vs convective 0.1 m²/s). Where N² ≈ 0, for example with grid-scale
-  random T perturbations, a 1-ulp difference can flip the branch, and
-  results then differ at O(1e-3). This is a property of the closure, not of
-  the decomposition: the same happens between CPU and GPU. With constant
-  mixing the difference stays at round-off.
+- **PP81 near N² = 0.** PP81 originally switched discontinuously from shear
+  mixing to the convective 0.1 m²/s at N² = 0. Where N² ≈ 0, for example
+  with grid-scale random T perturbations, a 1-ulp difference flipped the
+  branch, and results differed at O(1e-3) after 2 days. Two changes fixed
+  this:
+  - the convective value is now blended in continuously over
+    −`vmix_n2_ramp` < N² < 0;
+  - N² is computed from T/S differences, not from two ~1025 kg m⁻³
+    densities.
+
+  With both changes the same experiment agrees to round-off (u ~2e-7),
+  like constant mixing. `tests/test_sharding.py` has a regression test.
 
 ## Python API
 

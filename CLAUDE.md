@@ -1,7 +1,7 @@
 # CLAUDE.md — OceanJAX 项目记忆
 
 本文件是跨会话（本地 / cloud session）共享的项目记忆。**每次会话结束前按第 9 节更新并推送。**
-最后更新：2026-09-29（cloud 会话），并行计算阶段 A 提交（分支 `parallel-phase-a`，`22c9e50` / `170c6a6` 之后）。
+最后更新：2026-09-29（cloud 会话），PP81 连续过渡 + 默认 PP81（分支 `pp81-continuous-mixing`，基于 `ff3dde2` = PR #1 并行阶段 A 合并后的 main）。
 
 ---
 
@@ -36,10 +36,12 @@ OceanJAX：用 JAX 写的三维可微分海洋模式（Boussinesq 静力原始�
   `verification_experiments/*` 和 `experiment.py` 的 ORAS5 模式**跑不了**（缺数据）。
 - Cloud 环境（2026-09-29）：Python 3.11、JAX 0.10.2、equinox 0.13.8，4 核 CPU，无 GPU。
   依赖需自己装：`pip install --ignore-installed packaging -r requirements.txt`（Debian 自带的 packaging 无法卸载）。
-- 跑测试：`python -m pytest OceanJAX/tests -q`（当前 198 passed, 0 skipped；cloud 4 核约 5.5 min）。
+- 跑测试：`python -m pytest OceanJAX/tests -q`（当前 208 passed, 0 skipped；cloud 4 核约 6 min）。
   `tests/conftest.py` 设置 `XLA_FLAGS=--xla_force_host_platform_device_count=8`（8 个模拟 CPU 设备），
   单设备代码不受影响；`test_sharding.py` 需要这 8 个设备。
-- 本地 `git stash@{0}`：旧的 OBC 半成品（`dynamics.py`/`tracers.py` 改动）；`OceanJAX/Physics/obc.py` 未跟踪。**这两者都只在本地，不在 GitHub。**
+- 本地 `git stash@{0}`：旧的 OBC 半成品（`dynamics.py`/`tracers.py` 改动）；`OceanJAX/Physics/obc.py` 未跟踪。
+  另：GitHub 上有远程分支 `feature/open-boundary-conditions`（`05a68fb`，基于 `thesis-v1`，8 个文件 +676 行），
+  内容未检查，与 2026-09-28 之后的修复和并行/PP81 改动未合并。
 - `OceanJAX/data/data_oras5/vomecrty_…_3D_202601_…nc` 单独文件已损坏（非本会话造成）；合并文件 `oras5_2026_01_native_merged.nc` 完好，模式只读合并文件。
 
 ## 4. 代码结构
@@ -83,8 +85,14 @@ docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多�
 - 冰点限制：T ≥ −0.0575·S（`limit_freezing=True`）。
 - **ν_h 是随分辨率变化的涡粘性闭合**（不是海水物性）：ORAS5 实验用 `munk_viscosity(grid)` = max(β·Δx³)。
   `ModelParams` 默认 nu_h=200 仅供测试。nu_h=200 在 2° 网格上会导致西边界 2Δ 噪声指数增长。
-- 垂直混合：`ModelParams(vertical_mixing="constant"|"pp81")`，默认 constant；experiment.py 用 pp81。
-  PP81：ν = ν₀/(1+αRi)ⁿ + ν_b，κ = ν₀/(1+αRi)ⁿ⁺¹ + κ_b，N²<0 时取对流值 0.1；动量和温盐都用。
+- 垂直混合：`ModelParams(vertical_mixing="constant"|"pp81")`，**默认 pp81**（2026-09-29 起）。
+  PP81：ν = ν₀/(1+αRi)ⁿ + ν_b，κ = ν₀/(1+αRi)ⁿ⁺¹ + κ_b；动量和温盐都用。
+  对流：N² < 0 时用 smoothstep 在 [−N²_c, 0] 内从 PP81(Ri=0) 连续过渡到 0.1，N²_c = `vmix_n2_ramp` = 1e-6 s⁻²
+  （0 = 旧的硬开关）；N² ≥ 0 的面与硬开关逐位一致。
+  N² 由温盐差分计算：N² = g(−αΔT + βΔS)/dz_w（线性 EOS 下与 ρ 差分等价，避免两个 ~1025 相减，
+  舍入噪声 1e-8 → 1e-10）。**若改非线性 EOS，`buoyancy_and_shear` 必须同步改。**
+  已知残留：无剪切时稳定侧 Ri = N²/max(S², 1e-12) 在 N² ~1e-11 内从 0 升到很大，κ 从 0.01 陡降到背景值（PP81 本身的 0/0，未改）。
+  需要"只有常数 κ"的测试/实验（κ_v=0 隔离、解析扩散解）必须显式写 `vertical_mixing="constant"`。
   垂直混合依赖**垂直**分辨率与边界层物理，不依赖水平分辨率；中高纬需要时再上 KPP。
 - ORAS5 实验：`oras5_grid(raw, LON, LAT, levels, Nx, Ny, periodic_x=False)`（格内 ORAS5 水深中位数）。
 - 多月强迫：`MonthlyForcing(dir, grid, start_date, interp="linear")`，月中为节点线性插值；
@@ -107,7 +115,7 @@ docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多�
 
 | 实验 | 结果 |
 |---|---|
-| 5.1.1 静止均匀 | T/S **严格守恒**（判定已改为 exact） PASS |
+| 5.1.1 静止均匀 | T/S **严格守恒**（判定已改为 exact） PASS；2026-09-29 改用 PP81 后在 cloud 重跑仍 PASS（全部严格为 0） |
 | 5.1.2 层结 + 真实地形 | A（κ=0）u/v/η/T 严格为 0；B/C 单调 0=A<B<C（比值仅记录）PASS |
 | 5.1.3 NullClosure | 逐位一致 PASS |
 | 5.1.4 CFL | dt≤900 s 稳定，1200 s NaN |
@@ -126,13 +134,14 @@ docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多�
 - experiment.py（rest 模式、2 天）2×3 分解与单设备差 ≤ 2e-8。
 - **发现：PP81 在 N²=0 处不连续**（剪切混合 ↔ 对流 0.1），N²≈0 时 1 ulp 差异可翻转分支，
   集合成员加 0.05 °C 网格尺度随机扰动时 2 天后差到 u ~3e-3、T ~4e-4；constant 混合时仅 ~1e-6。
-  这是闭合本身对舍入敏感（CPU vs GPU 同样会出现），不是分片 bug；对伴随梯度也有影响。
+  **已修复（2026-09-29）**：同一实验（experiment.py rest 模式，2 成员 × 2×1 分解 vs 2 设备集合）day 2 的 u 差：
+  旧 2.7e-3 → 只改 N²（硬开关）7.5e-6 且增长 → 连续过渡 + 新 N² 1.9e-7（与 constant 相同，舍入量级）。
+  `test_sharding.py::test_pp81_near_neutral_insensitive_to_roundoff` 为回归测试（硬开关 u 差 1.5e-5，现 ~9e-7）。
 
 ## 8. 已知问题与待办
 
 - **表层热点**：固定热通量无 SST 反馈，停滞副热带格点 2 年后 > 40 °C。方案：Haney 恢复项
   Q = Q_ORAS5 + γ(SST_ORAS5 − SST)，γ≈40 W/m²/K（用户已理解，**推迟实现**）。
-- 验证实验脚本是否改用 PP81：**待用户决定**。
 - ORCA 风应力沿网格 i/j 方向，高纬北大西洋未旋转到东/北。
 - 可变分辨率下 ν_h 应随空间变化（目前全域取最大值）。
 - 中高纬混合层：以后考虑 KPP。
@@ -141,7 +150,9 @@ docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多�
   待办：在真实多 GPU / 多节点集群上实测（`init_distributed` + SLURM 路径尚未实测）与 benchmark 效率；
   阶段 B（shard_map + 显式 halo 交换，`parallel/halo.py`）仅在集群实测效率不足时再做。
   experiment.py：`N_DEVICES_X/Y` > 1 时走 `sharded_run`，只有进程 0 打印和写 NetCDF。
-- PP81 在 N²=0 处的不连续开关对舍入敏感（见第 7 节）；是否平滑化（如对 N² 做连续过渡）**待用户决定**。
+- PP81 连续过渡已完成（见第 5、7 节）。验证脚本已改：5.1.1/5.1.3/5.1.4/5.2.x/大西洋 180 d 用 PP81，
+  5.1.2、5.1.5 **保持 constant**（需要 κ=0 严格为零 / 检验 κ_v 缩放）。
+  **需要在本地用 ORAS5 重跑**：5.1.3、5.1.4（CFL 上限可能变）、5.2.1–5.2.3、大西洋 180 d；论文第 5 章数值随之更新。
 - `runtime_test/benchmark_parallel.py` 集合模式里 `batch_run` 未 jit，每次重新 trace，计时偏慢（旧问题，未改）。
 
 ## 9. 会话结束前（每次）

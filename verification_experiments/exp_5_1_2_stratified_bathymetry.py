@@ -13,6 +13,9 @@ Setup
       A  kappa_v = kappa_h = 0      numerical-consistency test
       B  kappa_v = 1e-5 (default)   physical response, recorded
       C  kappa_v = 2e-5             attribution check against B
+    All three use constant vertical mixing (vertical_mixing="constant"):
+    case A needs kappa_v = 0 exactly, and B/C attribute the response to
+    kappa_v, which PP81's Ri-dependent shear term would confound.
 
 Rationale
 ---------
@@ -210,11 +213,14 @@ def run_case(label: str, params: ModelParams) -> dict:
 t0_wall = _time.time()
 KAPPA_V = 1e-5
 res_A = run_case("A: no diffusion (kappa_v = kappa_h = 0) — numerical consistency",
-                 ModelParams(nu_h=NU_H, dt=DT, kappa_v=0.0, kappa_h=0.0))
+                 ModelParams(nu_h=NU_H, dt=DT, kappa_v=0.0, kappa_h=0.0,
+                             vertical_mixing="constant"))
 res_B = run_case(f"B: kappa_v = {KAPPA_V:g} — physical response (recorded)",
-                 ModelParams(nu_h=NU_H, dt=DT, kappa_v=KAPPA_V))
+                 ModelParams(nu_h=NU_H, dt=DT, kappa_v=KAPPA_V,
+                             vertical_mixing="constant"))
 res_C = run_case(f"C: kappa_v = {2*KAPPA_V:g} — attribution check",
-                 ModelParams(nu_h=NU_H, dt=DT, kappa_v=2 * KAPPA_V))
+                 ModelParams(nu_h=NU_H, dt=DT, kappa_v=2 * KAPPA_V,
+                             vertical_mixing="constant"))
 wall = _time.time() - t0_wall
 
 # ---------------------------------------------------------------------------
