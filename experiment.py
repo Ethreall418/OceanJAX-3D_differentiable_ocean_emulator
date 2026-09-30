@@ -146,6 +146,13 @@ N_DEVICES_Y = 1
 OUTPUT_NC     = "output_cold_full_forcing.nc"
 SAVE_INTERVAL = 288   # steps between NetCDF snapshots  (288 × 300 s = 1 day)
 CHUNK_SIZE    = 288   # steps per JIT-compiled scan call
+#   SAVE_DAILY_3D = False writes only surface fields (SST, SSS, eta) per
+#   snapshot, which keeps long high-resolution runs small.
+SAVE_DAILY_3D = True
+#   Calendar-month means of T, S, u, v, eta (sampled at every snapshot) are
+#   written to MONTHLY_NC; None disables them.  Used by
+#   verification_experiments/hindcast_eval.py.
+MONTHLY_NC    = None
 
 # ==============================================================================
 # END OF CONFIGURATION
@@ -153,6 +160,7 @@ CHUNK_SIZE    = 288   # steps per JIT-compiled scan call
 
 
 _SCRIPT_DIR = Path(__file__).parent
+_DEPTH_LEVELS = None      # exact float64 centre depths, set by _build_grid
 _ORAS5_FILE = _SCRIPT_DIR / ORAS5_PATH
 
 
@@ -185,8 +193,9 @@ def _build_grid(raw):
     from OceanJAX.grid import OceanGrid, face_depths
     from OceanJAX.data.oras5 import oras5_grid
 
-    global NZ
+    global NZ, _DEPTH_LEVELS
     depth_levels = _depth_levels(raw)
+    _DEPTH_LEVELS = np.asarray(depth_levels, dtype=np.float64)
     NZ    = len(depth_levels)
     dz    = np.diff(face_depths(depth_levels))
     print(f"  levels    : {VERTICAL_LEVELS}, {NZ} layers, top {dz[0]:.1f} m, "
@@ -348,6 +357,29 @@ def _broadcast_forcing_to_ensemble(forcing, n_members: int):
 # NetCDF helpers
 # ---------------------------------------------------------------------------
 
+def _write_grid_info(ds: nc_lib.Dataset, grid) -> None:
+    """
+    Store what is needed to rebuild the model grid exactly,
+    OceanGrid.create(lon_bounds, lat_bounds, z_exact, Nx, Ny, bathymetry=H,
+    periodic_x=periodic_x), plus the resulting wet mask for convenience.
+    Assumes the "x", "y", "z" dimensions already exist.
+    """
+    ds.lon_bounds      = np.array(LON, dtype=np.float64)
+    ds.lat_bounds      = np.array(LAT, dtype=np.float64)
+    ds.periodic_x      = int(grid.periodic_x)
+    ds.vertical_levels = VERTICAL_LEVELS
+    ds.depth_max       = DEPTH_MAX
+    ds.dz_top          = DZ_TOP
+    ds.init_mode       = INIT_MODE
+    ds.start_date      = START_DATE
+    v = ds.createVariable("H", "f4", ("x", "y")); v.units = "m"; v[:] = np.array(grid.H)
+    ds.createVariable("mask_c", "i1", ("x", "y", "z"))[:] = np.array(grid.mask_c).astype(np.int8)
+    v = ds.createVariable("z_exact", "f8", ("z",)); v.units = "m"
+    v.long_name = "cell-centre depths (float64) for OceanGrid.create"
+    v[:] = (np.asarray(grid.z_c, dtype=np.float64) if _DEPTH_LEVELS is None
+            else _DEPTH_LEVELS)
+
+
 def _create_nc(path: str, grid) -> nc_lib.Dataset:
     ds = nc_lib.Dataset(path, mode="w", format="NETCDF4")
     ds.description = f"OceanJAX experiment  init={INIT_MODE}  N_ensemble={N_ENSEMBLE}"
@@ -376,28 +408,21 @@ def _create_nc(path: str, grid) -> nc_lib.Dataset:
     v = ds.createVariable("z",    "f4", ("z",));     v.units = "m";             v[:] = np.array(grid.z_c)
     v = ds.createVariable("zw",   "f4", ("zw",));    v.units = "m";             v[:] = np.array(grid.z_w)
 
+    _write_grid_info(ds, grid)
+    ds.save_daily_3d = int(SAVE_DAILY_3D)
+
+    lead = ("time", "member") if N_ENSEMBLE > 1 else ("time",)
     if N_ENSEMBLE > 1:
         ds.createDimension("member", N_ENSEMBLE)
-        ds.createVariable("T",   "f4", ("time", "member", "x", "y", "z"),  fill_value=np.float32(np.nan))
-        ds.createVariable("S",   "f4", ("time", "member", "x", "y", "z"),  fill_value=np.float32(np.nan))
-        ds.createVariable("eta", "f4", ("time", "member", "x", "y"),        fill_value=np.float32(np.nan))
-        ds.createVariable("u",   "f4", ("time", "member", "x", "y", "z"),  fill_value=np.float32(np.nan))
-        ds.createVariable("v",   "f4", ("time", "member", "x", "y", "z"),  fill_value=np.float32(np.nan))
-        ds.createVariable("w",   "f4", ("time", "member", "x", "y", "zw"), fill_value=np.float32(np.nan))
+    units = {"T": "degC", "S": "psu", "u": "m s-1", "v": "m s-1", "w": "m s-1",
+             "eta": "m", "sst": "degC", "sss": "psu"}
+    if SAVE_DAILY_3D:
+        spec = {"T": "z", "S": "z", "u": "z", "v": "z", "w": "zw", "eta": None}
     else:
-        ds.createVariable("T",   "f4", ("time", "x", "y", "z"),  fill_value=np.float32(np.nan))
-        ds.createVariable("S",   "f4", ("time", "x", "y", "z"),  fill_value=np.float32(np.nan))
-        ds.createVariable("eta", "f4", ("time", "x", "y"),        fill_value=np.float32(np.nan))
-        ds.createVariable("u",   "f4", ("time", "x", "y", "z"),  fill_value=np.float32(np.nan))
-        ds.createVariable("v",   "f4", ("time", "x", "y", "z"),  fill_value=np.float32(np.nan))
-        ds.createVariable("w",   "f4", ("time", "x", "y", "zw"), fill_value=np.float32(np.nan))
-    # attach units
-    ds.variables["T"].units   = "degC"
-    ds.variables["S"].units   = "psu"
-    ds.variables["eta"].units = "m"
-    ds.variables["u"].units   = "m s-1"
-    ds.variables["v"].units   = "m s-1"
-    ds.variables["w"].units   = "m s-1"
+        spec = {"sst": None, "sss": None, "eta": None}
+    for name, zdim in spec.items():
+        dims = lead + ("x", "y") + ((zdim,) if zdim else ())
+        ds.createVariable(name, "f4", dims, fill_value=np.float32(np.nan)).units = units[name]
     return ds
 
 
@@ -407,22 +432,84 @@ def _write_snapshot(ds: nc_lib.Dataset, state) -> None:
     # For ensemble state, state.time has shape (N_ENSEMBLE,); use member 0's time.
     t = float(state.time) if state.time.ndim == 0 else float(state.time[0])
     ds.variables["time"][i] = t
-    if N_ENSEMBLE > 1:
-        # state arrays: (N_ENSEMBLE, NX, NY, NZ) or (N_ENSEMBLE, NX, NY)
-        ds.variables["T"][i,   :, :, :, :] = np.array(state.T)
-        ds.variables["S"][i,   :, :, :, :] = np.array(state.S)
-        ds.variables["eta"][i, :, :, :]    = np.array(state.eta)
-        ds.variables["u"][i,   :, :, :, :] = np.array(state.u)
-        ds.variables["v"][i,   :, :, :, :] = np.array(state.v)
-        ds.variables["w"][i,   :, :, :, :] = np.array(state.w)
+    fields = {"eta": np.array(state.eta)}
+    if SAVE_DAILY_3D:
+        fields.update(T=np.array(state.T), S=np.array(state.S), u=np.array(state.u),
+                      v=np.array(state.v), w=np.array(state.w))
     else:
-        ds.variables["T"][i,   :, :, :] = np.array(state.T)
-        ds.variables["S"][i,   :, :, :] = np.array(state.S)
-        ds.variables["eta"][i, :, :]    = np.array(state.eta)
-        ds.variables["u"][i,   :, :, :] = np.array(state.u)
-        ds.variables["v"][i,   :, :, :] = np.array(state.v)
-        ds.variables["w"][i,   :, :, :] = np.array(state.w)
+        fields.update(sst=np.array(state.T)[..., 0], sss=np.array(state.S)[..., 0])
+    for name, arr in fields.items():
+        ds.variables[name][i, ...] = arr
     ds.sync()
+
+
+class _MonthlyMeans:
+    """
+    Running calendar-month means of T, S, u, v, eta, written to MONTHLY_NC.
+
+    ``add(state, t_seconds)`` accumulates a host state sampled at model time
+    t (seconds since START_DATE) into the calendar month containing t; when
+    a sample falls into a new month the previous month is written out.
+    ``close()`` writes the last month.  Each record stores the month
+    (YYYYMM), the number of samples and the first / last sample time, so a
+    partial first or last month is visible.
+    """
+    FIELDS = ("T", "S", "u", "v", "eta")
+
+    def __init__(self, path: str, grid):
+        self.start = np.datetime64(START_DATE, "s")
+        self.ds = ds = nc_lib.Dataset(path, mode="w", format="NETCDF4")
+        ds.description = f"OceanJAX calendar-month means  init={INIT_MODE}"
+        ds.domain = f"lon={LON} lat={LAT}"
+        ds.dt = DT
+        for name, n in (("time", None), ("x", grid.Nx), ("y", grid.Ny), ("z", grid.Nz)):
+            ds.createDimension(name, n)
+        ds.createVariable("x", "f4", ("x",))[:] = np.array(grid.lon_c)
+        ds.createVariable("y", "f4", ("y",))[:] = np.array(grid.lat_c)
+        ds.createVariable("z", "f4", ("z",))[:] = np.array(grid.z_c)
+        _write_grid_info(ds, grid)
+        lead = ("time",)
+        if N_ENSEMBLE > 1:
+            ds.createDimension("member", N_ENSEMBLE)
+            lead = ("time", "member")
+        ds.createVariable("month", "i4", ("time",)).long_name = "YYYYMM"
+        ds.createVariable("n_samples", "i4", ("time",))
+        for name in ("t_first", "t_last"):
+            ds.createVariable(name, "f8", ("time",)).units = f"seconds since {START_DATE}"
+        units = {"T": "degC", "S": "psu", "u": "m s-1", "v": "m s-1", "eta": "m"}
+        for name in self.FIELDS:
+            dims = lead + (("x", "y") if name == "eta" else ("x", "y", "z"))
+            ds.createVariable(name, "f4", dims, fill_value=np.float32(np.nan)).units = units[name]
+        self.month, self.sums, self.n, self.t0, self.t1 = None, None, 0, None, None
+
+    def add(self, state, t_seconds: float) -> None:
+        month = (self.start + np.timedelta64(int(round(t_seconds)), "s")).astype("datetime64[M]")
+        if self.month is not None and month != self.month:
+            self._flush()
+        if self.month is None:
+            self.month, self.n, self.t0 = month, 0, t_seconds
+            self.sums = {f: np.zeros(np.shape(getattr(state, f)), np.float64) for f in self.FIELDS}
+        for f in self.FIELDS:
+            self.sums[f] += np.asarray(getattr(state, f), np.float64)
+        self.n += 1
+        self.t1 = t_seconds
+
+    def _flush(self) -> None:
+        ds, i = self.ds, len(self.ds.variables["month"])
+        m = int(self.month.astype(np.int64))
+        ds.variables["month"][i] = (1970 + m // 12) * 100 + m % 12 + 1
+        ds.variables["n_samples"][i] = self.n
+        ds.variables["t_first"][i] = self.t0
+        ds.variables["t_last"][i] = self.t1
+        for f in self.FIELDS:
+            ds.variables[f][i, ...] = (self.sums[f] / self.n).astype(np.float32)
+        ds.sync()
+        self.month = None
+
+    def close(self) -> None:
+        if self.month is not None:
+            self._flush()
+        self.ds.close()
 
 
 def _diag_line(state, sim_day: float, steps_done: int, wall: float, grid) -> bool:
@@ -587,7 +674,12 @@ def main() -> None:
     host_state = to_host(state)
     if is_main:
         _write_snapshot(ds, host_state)
-    print(f"\nOutput: {OUTPUT_NC}  (t=0 saved)\n")
+    print(f"\nOutput: {OUTPUT_NC}  (t=0 saved)")
+    monthly = None
+    if is_main and MONTHLY_NC is not None:
+        monthly = _MonthlyMeans(MONTHLY_NC, grid)
+        print(f"Monthly means: {MONTHLY_NC}")
+    print()
 
     if ensemble:
         print(f"{'Day':>5}  {'Step':>6}  "
@@ -628,6 +720,8 @@ def main() -> None:
             if steps_done == next_save_step:
                 if is_main:
                     _write_snapshot(ds, host_state)
+                    if monthly is not None:
+                        monthly.add(host_state, steps_done * DT)
                 next_save_step += SAVE_INTERVAL
 
             if bad:
@@ -638,6 +732,8 @@ def main() -> None:
     finally:
         if ds is not None:
             ds.close()
+        if monthly is not None:
+            monthly.close()
 
     print("-" * 90)
     label = f"stable for {N_DAYS} days" if all_ok else "model blew up"

@@ -850,3 +850,57 @@ class TestOras5Levels:
         from OceanJAX.data.oras5 import oras5_levels
         with pytest.raises(ValueError):
             oras5_levels(self.DEPTHS, depth_max=5.0, dz_min=10.0)
+
+
+# ---------------------------------------------------------------------------
+# Per-variable monthly files: read_oras5(list) and oras5_month_files
+# ---------------------------------------------------------------------------
+
+def _write_month_split(directory, ym="202602", merged_name=None):
+    """A merged NEMO file with non-trivial u/v/eta, optionally split per variable."""
+    merged = directory / "tmp_merged.nc"
+    _write_nemo_nc(merged, u_name="vozocrtx", v_name="vomecrty", eta_name="sossheig")
+    with xr.open_dataset(merged) as src:           # close before unlink (Windows)
+        ds = src.load()
+    rng = np.random.default_rng(0)
+    for v in ("vozocrtx", "vomecrty", "sossheig"):
+        ds[v] = ds[v] + rng.normal(size=ds[v].shape).astype(np.float32)
+    ds.to_netcdf(directory / (merged_name or "merged.nc"))
+    for v in ("votemper", "vosaline", "vozocrtx", "vomecrty", "sossheig"):
+        kind = "2D" if v == "sossheig" else "3D"
+        ds[[v]].to_netcdf(directory / f"{v}_control_monthly_highres_{kind}_{ym}_OPER_v0.1.nc")
+    merged.unlink()
+    return directory / (merged_name or "merged.nc")
+
+
+class TestMonthFiles:
+
+    def test_split_files_read_like_merged(self, tmp_path):
+        from OceanJAX.data.oras5 import oras5_month_files
+        merged = _write_month_split(tmp_path)
+        a = read_oras5(merged)
+        b = read_oras5(oras5_month_files(tmp_path, 2026, 2))
+        for k in ("T", "S", "u", "v", "eta", "lon", "lat", "depth"):
+            np.testing.assert_array_equal(a[k], b[k], err_msg=k)
+
+    def test_prefers_merged_file(self, tmp_path):
+        from OceanJAX.data.oras5 import oras5_month_files
+        _write_month_split(tmp_path, merged_name="oras5_2026_02_native_merged.nc")
+        files = oras5_month_files(tmp_path, 2026, 2)
+        assert [f.name for f in files] == ["oras5_2026_02_native_merged.nc"]
+
+    def test_missing_velocity_warns(self, tmp_path):
+        from OceanJAX.data.oras5 import oras5_month_files
+        _write_month_split(tmp_path)
+        next(tmp_path.glob("vomecrty_*")).unlink()
+        with pytest.warns(UserWarning, match="vomecrty"):
+            files = oras5_month_files(tmp_path, 2026, 2)
+        assert len(files) == 4
+        assert read_oras5(files)["v"] is None
+
+    def test_missing_temperature_raises(self, tmp_path):
+        from OceanJAX.data.oras5 import oras5_month_files
+        _write_month_split(tmp_path)
+        next(tmp_path.glob("votemper_*")).unlink()
+        with pytest.raises(FileNotFoundError):
+            oras5_month_files(tmp_path, 2026, 2)

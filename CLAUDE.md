@@ -54,7 +54,7 @@ OceanJAX：用 JAX 写的三维可微分海洋模式（Boussinesq 静力原始�
   `verification_experiments/*` 和 `experiment.py` 的 ORAS5 模式**跑不了**（缺数据）。
 - Cloud 环境（2026-09-29）：Python 3.11、JAX 0.10.2、equinox 0.13.8，4 核 CPU，无 GPU。
   依赖需自己装：`pip install --ignore-installed packaging -r requirements.txt`（Debian 自带的 packaging 无法卸载）。
-- 跑测试：`python -m pytest OceanJAX/tests -q`（当前 222 passed；cloud 4 核约 6 min）。
+- 跑测试：`python -m pytest OceanJAX/tests -q`（当前 232 passed；cloud 4 核约 6 min）。
   `tests/conftest.py` 设置 `XLA_FLAGS=--xla_force_host_platform_device_count=8`（8 个模拟 CPU 设备），
   单设备代码不受影响；`test_sharding.py` 需要这 8 个设备。
 - 本地 `git stash@{0}`：旧的 OBC 半成品（`dynamics.py`/`tracers.py` 改动）；`OceanJAX/Physics/obc.py` 未跟踪。
@@ -201,6 +201,35 @@ docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多�
 - **ORAS5 数据（2026-09-30 本地）**：2026-01～06 月齐全（每月 4 个强迫 + sossheig + votemper/vosaline/vozocrtx/vomecrty），
   全部可读、时间戳在月中；无单独 SST/SSS 2D 文件（可用 3D 最上层代替）。1 月 vomecrty 单独文件仍损坏（合并文件完好）。
   MonthlyForcing 识别 1–6 月；6 月 16 日后因无 7 月数据保持 6 月值。
+- **后报检验工具（2026-09-30 完成）**：
+  - `read_oras5(path 或 [同月多个文件])`（内存中合并）；`oras5_month_files(dir, y, m)`：优先 `oras5_YYYY_MM_native_merged.nc`，
+    否则按 `_YYYYMM_` 找 votemper/vosaline/vozocrtx/vomecrty/sossheig（T、S 必需）。不再需要逐月生成合并文件。
+  - experiment.py：`MONTHLY_NC`（日历月平均 T/S/u/v/η，每个快照采样，记录 month/n_samples/t_first/t_last）、
+    `SAVE_DAILY_3D=False`（逐日只存 sst/sss/eta）；输出文件带网格描述（lon/lat_bounds、`z_exact`、mask_c、H、periodic_x…）。
+  - `OceanJAX/diagnostics.py`：`compare_fields`（面积加权 bias/RMSE/相关）、`skill_score`、`weighted_mean`。
+  - `verification_experiments/hindcast_eval.py MONTHLY_NC`：用 `z_exact` + 由 mask_c 反推的 H 重建网格
+    （存的 H 是 float32，会少一层，不能直接用），ORAS5 插值到模式网格/层深后比较 SST、SSS、T/S@~100/300/1000 m、
+    SSH（去区域平均）、表层流速；与持续性（初始月 ORAS5）比较得 skill；change corr；分区 all/tropics/north/south；
+    输出 metrics.csv、summary.md、rmse_by_month.png、maps_*.png。初始月（不完整）不评分。
+  - `verification_experiments/exp_hindcast.py [--days N] [--eval-only]`：大西洋 1°、ORAS5 层深 dz_min 10 → 49 层到 3995 m、
+    dt 90 s（CFL 0.314）、全场初始化（oras5_full，起点 2026-01-16T12:00）、1–6 月逐月强迫、PP81、Munk ν_h、无恢复项；
+    输出到 `hindcast_output/`（.gitignore）。
+  - 新增 `.gitignore`：hindcast_output/、output_*.nc、ORAS5 *.nc、__pycache__、.idea。
+  - 20 天冒烟测试：全场初始化稳定；浅陆架/湾流离岸处半个月升温 +8 °C（固定通量无反馈的热点，浅水更快）。
+- **后报检验结果（2026-09-30，exp_hindcast.py，165.5 d，CPU 52 min，稳定）**：
+  | 变量 | 2 月 RMSE（持续性）/ skill / change corr | 6 月 RMSE（持续性）/ skill / change corr |
+  |---|---|---|
+  | SST | 1.69（0.94）/ −0.81 / 0.65 | 3.77（2.81）/ −0.34 / **0.81** |
+  | SSS | 0.47（0.34）/ −0.39 / 0.37 | 0.70（0.64）/ −0.08 / 0.63（5 月 skill +0.14） |
+  | T~100 m | 1.01（0.87）/ −0.15 / 0.50 | 1.69（1.42）/ −0.19 / 0.47 |
+  | T~300 m | 0.65（0.45）/ −0.44 / 0.36 | 0.94（0.66）/ −0.42 / 0.38 |
+  | SSH | 0.17（0.05）/ −2.19 / 0.00 | 0.15（0.07）/ −1.10 / 0.28 |
+  解读：季节变化**格局**对（SST change corr 0.81），**幅度**错：北半球 20–60°N 夏季偏暖 5–15 °C
+  （10.8 m 表层 + PP81 无风搅混合层加深 + 固定通量无 SST 反馈）；SSH 误差在全场初始化后几天内调整到模式自身平衡、之后不变；
+  次表层持续性难超越、有缓慢漂移。
+  **负盐度**：亚马孙河口 1 层柱（49.5°W, 0.2°N）SSS 降到 −28 psu——虚拟盐通量用固定 S_ref=35 × (E−P)，
+  ORAS5 淡水通量含河流径流（~−1.5 psu/天）。修复方案：改用当地 SSS（进行中）。
+  后续候选（用户说"以后再考虑"）：SST 反馈（恢复到初始月/气候态而非当月，避免"看答案"）、KPP 混合层。
 - **后报检验实验**（用户计划，数据已就绪）：实验 1 = 1 月初始、积分到 2 月，与 ORAS5 2 月比较；
   实验 2 = 逐月强迫积分到 6 月，与 ORAS5 6 月比较。要点：起始 2026-01-16T12:00（月平均代表月中）；
   模式月平均对比 ORAS5 月平均；持续性预报（ORAS5 1 月）作为基准；主实验关闭 SST 恢复项（否则"看答案"）。

@@ -142,7 +142,7 @@ def _ensure_ascending(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # ---------------------------------------------------------------------------
 
 def read_oras5(
-    path: str | Path,
+    path: str | Path | list,
     time_index: int = 0,
 ) -> dict[str, Optional[np.ndarray]]:
     """
@@ -155,8 +155,12 @@ def read_oras5(
 
     Parameters
     ----------
-    path : str or Path
-        NetCDF file containing at least temperature and salinity.
+    path : str, Path, or list of them
+        NetCDF file containing at least temperature and salinity, or several
+        files of the same month that together do (e.g. the per-variable
+        ORAS5 files votemper_*, vosaline_*, vozocrtx_*, vomecrty_*,
+        sossheig_*; see ``oras5_month_files``).  Several files are merged
+        lazily in memory, exactly as ``data_merger.py`` merges them on disk.
     time_index : int
         Index along the time dimension to read (default 0).
 
@@ -194,7 +198,12 @@ def read_oras5(
     ``mask_and_scale=True`` handles ``_FillValue`` / ``missing_value``
     automatically).
     """
-    ds = xr.open_dataset(path, mask_and_scale=True)
+    paths = list(path) if isinstance(path, (list, tuple)) else [path]
+    parts = [xr.open_dataset(p, mask_and_scale=True) for p in paths]
+    ds = parts[0] if len(parts) == 1 else xr.merge(
+        [d.drop_vars("time_counter_bnds", errors="ignore") for d in parts],
+        compat="override",
+    )
     try:
         # --- coordinates ---
         lon_name   = _find_coord(ds, "lon")
@@ -357,6 +366,8 @@ def read_oras5(
 
     finally:
         ds.close()
+        for d in parts:
+            d.close()
 
     return {
         "T": T, "S": S, "u": u, "v": v, "eta": eta,
@@ -954,6 +965,48 @@ def load_oras5(
         T_fill=T_fill,
         S_fill=S_fill,
     )
+
+
+# ---------------------------------------------------------------------------
+# Public: oras5_month_files
+# ---------------------------------------------------------------------------
+
+#: ORAS5 variables that make up one month of ocean state (T, S required).
+ORAS5_STATE_VARS: tuple[str, ...] = ("votemper", "vosaline", "vozocrtx", "vomecrty", "sossheig")
+
+
+def oras5_month_files(directory: str | Path, year: int, month: int) -> list[Path]:
+    """
+    Files holding the ORAS5 ocean state of one month, for ``read_oras5``.
+
+    A merged file ``oras5_<YYYY>_<MM>_native_merged.nc`` (``data_merger.py``)
+    is used if present; otherwise the per-variable files
+    ``<var>_control_monthly_highres_<2D|3D>_<YYYYMM>_*.nc`` for
+    ``ORAS5_STATE_VARS``.  Temperature and salinity are required; missing
+    velocity / SSH files only trigger a warning (``read_oras5`` then returns
+    None for them).
+
+    Raises:
+        FileNotFoundError if temperature or salinity is missing.
+    """
+    directory = Path(directory)
+    merged = directory / f"oras5_{year:04d}_{month:02d}_native_merged.nc"
+    if merged.exists():
+        return [merged]
+    tag = f"_{year:04d}{month:02d}_"
+    found = {}
+    for var in ORAS5_STATE_VARS:
+        hits = sorted(p for p in directory.glob(f"{var}_*.nc") if tag in p.name)
+        if hits:
+            found[var] = hits[0]
+    missing = [v for v in ORAS5_STATE_VARS if v not in found]
+    if "votemper" in missing or "vosaline" in missing:
+        raise FileNotFoundError(
+            f"ORAS5 {year}-{month:02d}: temperature/salinity files not found in {directory}")
+    if missing:
+        warnings.warn(f"ORAS5 {year}-{month:02d}: no file for {missing}", UserWarning,
+                      stacklevel=2)
+    return list(found.values())
 
 
 # ---------------------------------------------------------------------------

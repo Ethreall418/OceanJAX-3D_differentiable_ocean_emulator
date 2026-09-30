@@ -1,0 +1,7 @@
+# Model output and experiment results (large NetCDF files, figures)
+hindcast_output/
+output_*.nc
+__pycache__/
+*.pyc
+.idea/
+OceanJAX/data/data_oras5/*.nc
