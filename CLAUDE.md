@@ -1,7 +1,7 @@
 # CLAUDE.md — OceanJAX 项目记忆
 
 本文件是跨会话（本地 / cloud session）共享的项目记忆。**每次会话结束前按第 9 节更新并推送。**
-最后更新：2026-09-29（本地会话），在 `cd5ae48`（PR #1 并行阶段 A + PR #2 PP81 连续过渡）之上用本地 ORAS5 重跑验证实验并验证区域分解。
+最后更新：2026-09-30（本地会话），WSL2 + GPU 环境、非均匀分层 + CFL 检查、修正底层界面错误；基于 `255a751`。
 
 ---
 
@@ -28,15 +28,33 @@ OceanJAX：用 JAX 写的三维可微分海洋模式（Boussinesq 静力原始�
 
 ## 3. 环境
 
-- 本地：Windows 11，项目 venv `.venv`（Python 3.14，JAX 0.9.2，equinox 0.13.6），**仅 CPU**。
-  原生 Windows 的 JAX 不支持 CUDA；WSL 已装平台但**没有 Linux 发行版**（用户需自行 `wsl --install -d Ubuntu-24.04`，GPU 暂缓）。
-  硬件：RTX 5090 24 GB（目前用不上），24 逻辑核。
+- 本地 Windows：项目 venv `.venv`（Python 3.14，JAX 0.9.2，equinox 0.13.6），**仅 CPU**（原生 Windows 的 JAX 无 CUDA）。
+  硬件：RTX 5090 D v2 24 GB（Blackwell，compute capability 12.0，驱动 610.88），24 逻辑核。
+- **本地 GPU（WSL2，2026-09-30 配好）**：Ubuntu-24.04（用户 `ethreall`），venv `~/venvs/oceanjax`
+  （Python 3.12，JAX **0.10.2** + `jax[cuda13]`，与 cloud 同版本）。代码/数据直接用 Windows 路径
+  `/mnt/c/Users/EEEthreall/PycharmProjects/EAEE9280_Personal_Research_Project`（同一份文件）。
+  用法：`wsl -d Ubuntu-24.04` → `source ~/venvs/oceanjax/bin/activate` → `cd` 到上述路径 → 照常跑 python/pytest。
+  activate 脚本里已固化两个环境变量：
+  - `XLA_PYTHON_CLIENT_PREALLOCATE=false`：显卡同时驱动 Windows 桌面，按需分配显存；
+  - `XLA_FLAGS=--xla_gpu_enable_command_buffer=`：**关闭 XLA CUDA graph**。WSL2 下 FUSION 类
+    command buffer 在编译好的步进循环**第二次执行**时段错误（exit 139）；与 JAX 版本（0.9.2/0.10.2/0.11.2）、
+    CUDA 版本（12.9/13.4）、显存分配方式都无关，只有关闭 command buffer 可解（WHILE/CONDITIONAL 类不崩但无加速）。
+    原生 Linux 集群上可能不存在此问题（未测）。
+  GPU 上测试：183 passed、25 skipped（多设备测试需 8 个模拟 CPU 设备；用 `JAX_PLATFORMS=cpu` 跑
+  `test_sharding.py test_parallel.py` 可覆盖，37 passed）。
+  实测（大西洋，ORAS5 层深每隔一层取到 4000 m = 33 层，PP81，Munk ν_h，冷启动 + 一月强迫）：
+  | 网格 | dt | GPU | CPU（同机） |
+  |---|---|---|---|
+  | 1°（100×80×33） | 90 s | 9.3 s/天 | 10.7 s/天（仅快 1.15 倍） |
+  | 0.5°（200×160×33） | 45 s | **22.5 s/天** | 125 s/天（**快 5.6 倍**；6 个月约 68 分钟） |
+  小网格 GPU 几乎无收益：每步有 ~300 个串行小 kernel（Thomas 4 次求解 × 2 次扫描 × Nz，加上
+  compute_w 和静水压力的逐层 scan），启动开销占主导，而 CUDA graph 又必须关闭。
 - **Cloud session 注意**：ORAS5 数据（`OceanJAX/data/data_oras5/*.nc`，约 3.5 GB）**不在仓库里**。
   因此 cloud 上：单元测试可跑（`test_oras5` / `test_monthly_forcing` 用合成数据）；
   `verification_experiments/*` 和 `experiment.py` 的 ORAS5 模式**跑不了**（缺数据）。
 - Cloud 环境（2026-09-29）：Python 3.11、JAX 0.10.2、equinox 0.13.8，4 核 CPU，无 GPU。
   依赖需自己装：`pip install --ignore-installed packaging -r requirements.txt`（Debian 自带的 packaging 无法卸载）。
-- 跑测试：`python -m pytest OceanJAX/tests -q`（当前 208 passed, 0 skipped；cloud 4 核约 6 min）。
+- 跑测试：`python -m pytest OceanJAX/tests -q`（当前 222 passed；cloud 4 核约 6 min）。
   `tests/conftest.py` 设置 `XLA_FLAGS=--xla_force_host_platform_device_count=8`（8 个模拟 CPU 设备），
   单设备代码不受影响；`test_sharding.py` 需要这 8 个设备。
 - 本地 `git stash@{0}`：旧的 OBC 半成品（`dynamics.py`/`tracers.py` 改动）；`OceanJAX/Physics/obc.py` 未跟踪。
@@ -98,6 +116,15 @@ docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多�
 - 多月强迫：`MonthlyForcing(dir, grid, start_date, interp="linear")`，月中为节点线性插值；
   缺月份 → 其他年同月 → 最近月份（目前只有 2026-01 → 永久一月）。只需下载 4 个 2D 文件/月。
 - 时间步：动量与 η 为 leapfrog + Asselin（α=0.1），首步 1·dt；温盐 AB3（首两步 AB1/AB2）。
+- **垂直分层**（2026-09-30）：`grid.face_depths(centres)` 是唯一的"中心 → 界面"规则（界面在相邻中心中点，
+  底面在最后中心下方半层）。**已修正旧错误**：以前底面只外推了 1/4 层，最底层比其他层薄 25%
+  （500 m/10 层时模式实际深 487.5 m）；修正后验证实验变化 ≤ 0.002 °C。
+  `grid.stretched_levels(depth_max, nz, dz_top)`：几何拉伸，二分求 r 使底面严格等于 depth_max（表层略厚几 %）。
+  `oras5.oras5_levels(depths_or_raw, depth_max, dz_min)`：取 ORAS5 自身层深，稀疏化使每层 ≥ dz_min，底面 ≤ depth_max。
+  experiment.py：`VERTICAL_LEVELS = "uniform"（默认）| "stretched" | "oras5"`，`DZ_TOP`（默认 10 m）。
+  表层 ≥ ~10 m（线性自由面要求 |η| ≪ 表层）；depth_max 不超过 ORAS5 数据（~5900 m）。
+- **CFL**：`grid.barotropic_cfl(grid, dt)` → (CFL, 安全 dt)，CFL = √(gH)·dt/Δx_min（H 取不超过模式底的最深湿柱），
+  `grid.CFL_LIMIT = 0.33`（5.1.4 实测稳定上限；0.445 发散）。experiment.py 启动时打印并在超限时警告。
 - **并行 / 区域分解（阶段 A）**：mesh 轴 ("batch","x","y")；凡是含 (Nx, Ny) 轴对的数组按 x/y 分片，其余复制；
   GSPMD 把 roll/移位 concatenate 编译成单格 halo 的 collective-permute。
   **不要把 x、y 两个轴 reshape 合并**（如 `reshape(Nx*Ny, Nz)`）——会触发整场 all-gather；
@@ -164,6 +191,21 @@ docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多�
   5.1.2、5.1.5 **保持 constant**（需要 κ=0 严格为零 / 检验 κ_v 缩放）。
   本地 ORAS5 重跑已完成（2026-09-29，见第 7 节）；论文第 5 章数值按第 7 节更新。
 - `runtime_test/benchmark_parallel.py` 集合模式里 `batch_run` 未 jit，每次重新 trace，计时偏慢（旧问题，未改）。
+- **GPU 性能优化（建议，未做）**：把串行的垂直 scan 改为并行原语——compute_w / 静水压力用 `jnp.cumsum`，
+  Thomas 求解改用 `lax.linalg.tridiagonal_solve`（批量，GPU 上是 cuSPARSE，保持增量形式）。
+  预计把每步 ~300 个串行 kernel 降到十几个，小网格 GPU 也能明显加速。
+- **大型实验设计要点**（2026-09-30 实测）：垂直层用 ORAS5 层深、表层 ≥ 10 m（线性自由面要求 |η| ≪ 表层厚度），
+  最大深度不超过 ORAS5 数据（~5900 m，建议 4000 m），否则深层 T/S 外推造成虚假流速（测试中曾出现 5 m/s）。
+  非均匀分层已完成（见第 5 节，2026-09-30）。4000 m 时：stretched 30 层（表层 10.4 m、底层 380 m）；
+  oras5 层深 dz_min=10 → 49 层（上层很密，计算量更大，可增大 dz_min）。
+- **ORAS5 数据（2026-09-30 本地）**：2026-01～06 月齐全（每月 4 个强迫 + sossheig + votemper/vosaline/vozocrtx/vomecrty），
+  全部可读、时间戳在月中；无单独 SST/SSS 2D 文件（可用 3D 最上层代替）。1 月 vomecrty 单独文件仍损坏（合并文件完好）。
+  MonthlyForcing 识别 1–6 月；6 月 16 日后因无 7 月数据保持 6 月值。
+- **后报检验实验**（用户计划，数据已就绪）：实验 1 = 1 月初始、积分到 2 月，与 ORAS5 2 月比较；
+  实验 2 = 逐月强迫积分到 6 月，与 ORAS5 6 月比较。要点：起始 2026-01-16T12:00（月平均代表月中）；
+  模式月平均对比 ORAS5 月平均；持续性预报（ORAS5 1 月）作为基准；主实验关闭 SST 恢复项（否则"看答案"）。
+  需要：按月读取 ORAS5 3D 场（`read_oras5` 只接受单个合并文件，拟改为接受同月多个文件）、模式月平均输出、检验脚本。
+- **Haney SST/SSS 恢复项**：详细方案已给出（γ_T、V_S、可选 sst_ref/sss_ref、净盐通量扣除），等用户确认。
 
 ## 9. 会话结束前（每次）
 

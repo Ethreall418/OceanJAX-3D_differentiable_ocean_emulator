@@ -26,9 +26,20 @@ import netCDF4 as nc_lib
 # --- Domain & resolution ------------------------------------------------------
 LON       = (-40.0, -5.0)    # (lon_min, lon_max) degrees east
 LAT       = (-15.0, 15.0)    # (lat_min, lat_max) degrees north
-DEPTH_MAX = 500.0             # m
-NX, NY, NZ = 20, 15, 10      # grid cells in x, y, z
-DT        = 300.0             # time step [s]
+DEPTH_MAX = 500.0             # m (model bottom)
+NX, NY, NZ = 20, 15, 10      # grid cells in x, y, z (NZ ignored for "oras5" levels)
+DT        = 300.0             # time step [s]; checked against the CFL limit at start-up
+
+# --- Vertical levels ----------------------------------------------------------
+#   "uniform"   — NZ equal layers of DEPTH_MAX / NZ
+#   "stretched" — NZ layers, DZ_TOP thick at the surface and growing
+#                 geometrically so that the bottom is exactly DEPTH_MAX
+#   "oras5"     — ORAS5's own levels down to DEPTH_MAX, thinned so that every
+#                 layer is at least DZ_TOP thick (number of levels follows)
+# Keep the top layer >= ~10 m (linear free surface: |eta| << top layer) and
+# DEPTH_MAX within the ORAS5 data (~5900 m).
+VERTICAL_LEVELS = "uniform"
+DZ_TOP          = 10.0        # m
 
 # --- Horizontal viscosity -----------------------------------------------------
 #   "munk" — nu_h from the Munk criterion for this grid (resolves the western
@@ -171,16 +182,40 @@ def _build_grid(raw):
     ORAS5 runs: land mask + bathymetry from ORAS5, closed east/west walls.
     "rest" runs: flat-bottom, zonally periodic ocean.
     """
-    from OceanJAX.grid import OceanGrid
+    from OceanJAX.grid import OceanGrid, face_depths
     from OceanJAX.data.oras5 import oras5_grid
-    dz           = DEPTH_MAX / NZ
-    depth_levels = (np.arange(NZ) + 0.5) * dz
+
+    global NZ
+    depth_levels = _depth_levels(raw)
+    NZ    = len(depth_levels)
+    dz    = np.diff(face_depths(depth_levels))
+    print(f"  levels    : {VERTICAL_LEVELS}, {NZ} layers, top {dz[0]:.1f} m, "
+          f"bottom {dz[-1]:.0f} m, model bottom {face_depths(depth_levels)[-1]:.0f} m")
     if raw is None:
         return OceanGrid.create(LON, LAT, depth_levels, NX, NY)
     grid = oras5_grid(raw, LON, LAT, depth_levels, NX, NY, periodic_x=False)
     wet_cols = int(np.asarray(grid.mask_c)[:, :, 0].sum())
     print(f"  ORAS5 land mask: {wet_cols}/{NX * NY} wet columns")
     return grid
+
+
+def _depth_levels(raw):
+    """Cell-centre depths for VERTICAL_LEVELS (see the CONFIG block)."""
+    from OceanJAX.grid import stretched_levels
+    from OceanJAX.data.oras5 import oras5_levels
+
+    if VERTICAL_LEVELS == "uniform":
+        return (np.arange(NZ) + 0.5) * (DEPTH_MAX / NZ)
+    if VERTICAL_LEVELS == "stretched":
+        return stretched_levels(DEPTH_MAX, NZ, DZ_TOP)
+    if VERTICAL_LEVELS == "oras5":
+        if raw is not None:
+            return oras5_levels(raw, DEPTH_MAX, DZ_TOP)
+        import xarray as xr                       # "rest" runs: read the depth axis only
+        with xr.open_dataset(_ORAS5_FILE) as ds:
+            return oras5_levels(np.asarray(ds["deptht"].values), DEPTH_MAX, DZ_TOP)
+    raise ValueError(f"VERTICAL_LEVELS must be 'uniform', 'stretched' or 'oras5'; "
+                     f"got {VERTICAL_LEVELS!r}")
 
 
 def _build_state(grid, raw):
@@ -471,7 +506,7 @@ def main() -> None:
     print("=" * 62)
     print(f"OceanJAX experiment")
     print(f"  domain    : lon={LON}  lat={LAT}  depth={DEPTH_MAX} m")
-    print(f"  grid      : {NX}x{NY}x{NZ}  dt={DT} s")
+    print(f"  grid      : {NX}x{NY} horizontal, {VERTICAL_LEVELS} levels  dt={DT} s")
     print(f"  run       : {N_DAYS} days  ({n_steps} steps)")
     if ensemble:
         print(f"  ensemble  : {N_ENSEMBLE} members  "
@@ -491,6 +526,14 @@ def main() -> None:
     params = ModelParams(dt=DT, nu_h=nu_h, vertical_mixing=VERTICAL_MIXING)
     print(f"  nu_h = {nu_h:.3g} m2/s  ({'Munk criterion' if NU_H == 'munk' else 'fixed'})"
           f"  vertical mixing: {VERTICAL_MIXING}")
+
+    # Barotropic CFL (surface gravity waves); exp. 5.1.4: stable <= 0.33, NaN at 0.45
+    from OceanJAX.grid import barotropic_cfl, CFL_LIMIT
+    cfl, dt_max = barotropic_cfl(grid, DT)
+    print(f"  CFL       : {cfl:.3f} (limit {CFL_LIMIT})  largest safe dt ~ {dt_max:.0f} s")
+    if cfl > CFL_LIMIT:
+        print(f"WARNING: DT = {DT} s exceeds the barotropic CFL limit; "
+              f"use DT <= {dt_max:.0f} s or the run may blow up.", file=sys.stderr)
     forcing_for = _make_forcing_provider(grid)
 
     # Build initial state(s)

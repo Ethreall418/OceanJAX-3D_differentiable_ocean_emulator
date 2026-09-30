@@ -33,6 +33,111 @@ DEG2RAD: float = math.pi / 180.0
 
 
 # ---------------------------------------------------------------------------
+# Vertical levels
+# ---------------------------------------------------------------------------
+
+def face_depths(centres: np.ndarray) -> np.ndarray:
+    """
+    Cell-face depths (Nz+1,) [m] from ascending cell-centre depths (Nz,).
+
+    This is the rule ``OceanGrid.create`` uses: the surface face is at 0,
+    interior faces sit midway between neighbouring centres, and the bottom
+    face lies half a cell below the last centre, i.e. as far below it as
+    the last interior face lies above it (so uniform centres give uniform
+    cells).  Before 2026-09-30 the bottom face was placed only a quarter
+    cell below the last centre, making the bottom cell 25 % too thin.
+    """
+    c = np.asarray(centres, dtype=np.float64)
+    n = len(c)
+    faces = np.empty(n + 1, dtype=np.float64)
+    faces[0] = 0.0
+    faces[1:n] = 0.5 * (c[:-1] + c[1:])
+    faces[n] = c[-1] + (c[-1] - faces[n - 1]) if n > 1 else 2.0 * c[-1]
+    return faces
+
+
+def stretched_levels(depth_max: float, nz: int, dz_top: float) -> np.ndarray:
+    """
+    Cell-centre depths (nz,) [m] with thicknesses growing geometrically with
+    depth, fine near the surface and coarse in the deep ocean.
+
+    Thicknesses follow dz_k = dz_top * r**k; the stretching factor r >= 1 is
+    found by bisection so that the grid's bottom face (``face_depths``, the
+    rule OceanGrid.create applies to the returned centres) lies exactly at
+    ``depth_max``.  Because OceanGrid places faces midway between centres,
+    the model's top cell comes out slightly thicker than ``dz_top``
+    (by ~(r - 1)/4, a few per cent).
+
+    Args:
+        depth_max : model bottom depth [m]
+        nz        : number of levels
+        dz_top    : target thickness of the top cell [m]
+
+    Returns:
+        (nz,) float64 ascending centre depths, ready for OceanGrid.create.
+
+    Raises:
+        ValueError if nz * dz_top > depth_max (even uniform levels would be
+        too deep) or an argument is not positive.
+    """
+    if nz < 1 or dz_top <= 0 or depth_max <= 0:
+        raise ValueError(f"need nz >= 1, dz_top > 0, depth_max > 0; got "
+                         f"nz={nz}, dz_top={dz_top}, depth_max={depth_max}")
+    if nz * dz_top > depth_max:
+        raise ValueError(
+            f"nz * dz_top = {nz * dz_top:g} m exceeds depth_max = {depth_max:g} m; "
+            f"reduce nz or dz_top."
+        )
+
+    def centres(r: float) -> np.ndarray:
+        dz = dz_top * r ** np.arange(nz)
+        f = np.concatenate([[0.0], np.cumsum(dz)])
+        return 0.5 * (f[:-1] + f[1:])
+
+    def bottom(r: float) -> float:
+        return face_depths(centres(r))[-1]
+
+    lo, hi = 1.0, 1.5
+    if bottom(lo) >= depth_max:            # uniform already reaches depth_max
+        return centres(lo) * depth_max / bottom(lo)
+    while bottom(hi) < depth_max:
+        hi = 1.0 + 2.0 * (hi - 1.0)
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if bottom(mid) < depth_max else (lo, mid)
+    c = centres(hi)
+    return c * depth_max / face_depths(c)[-1]           # remove residual rounding
+
+
+#: Empirical barotropic CFL stability limit of the time stepping (exp. 5.1.4).
+CFL_LIMIT: float = 0.33
+
+
+def barotropic_cfl(grid: "OceanGrid", dt: float, g: float = 9.81) -> tuple[float, float]:
+    """
+    Barotropic (surface gravity wave) CFL number and the largest dt that
+    keeps it at the empirical stability limit.
+
+      CFL = sqrt(g * H) * dt / dx_min
+
+    H is the deepest wet column the model resolves (bathymetry capped at the
+    model bottom), dx_min the smallest horizontal spacing over wet columns.
+    Experiment 5.1.4 found the leapfrog / Asselin scheme stable up to
+    CFL ~ 0.33 and unstable at ~0.45.
+
+    Returns:
+        (cfl, dt_max) with dt_max = 0.33 * dx_min / sqrt(g * H)  [s].
+    """
+    wet = np.asarray(grid.mask_c)[:, :, 0] > 0
+    z_bottom = float(np.asarray(grid.z_w)[-1])
+    H  = min(float(np.asarray(grid.H)[wet].max()), z_bottom) if wet.any() else z_bottom
+    dx = np.minimum(np.asarray(grid.dx_c), np.asarray(grid.dy_c))
+    dx_min = float(dx[wet].min() if wet.any() else dx.min())
+    c = np.sqrt(g * H)
+    return c * dt / dx_min, CFL_LIMIT * dx_min / c
+
+
+# ---------------------------------------------------------------------------
 # OceanGrid
 # ---------------------------------------------------------------------------
 class OceanGrid(eqx.Module):
@@ -126,7 +231,7 @@ class OceanGrid(eqx.Module):
         depth_levels: 1-D array of cell-center depths [m, positive down].
                       Length = Nz.  Cell faces are computed as midpoints
                       between consecutive centres (plus surface=0 and a
-                      bottom face one half-cell below the last center).
+                      bottom face half a cell below the last center; see face_depths).
         Nx, Ny      : number of tracer cells in x and y
         bathymetry  : (Nx, Ny) array of total depth [m].  If None, flat
                       bottom at depth_levels[-1] + dz/2.
@@ -175,13 +280,7 @@ class OceanGrid(eqx.Module):
 
         # --- vertical coordinates ------------------------------------------
         z_c_np = depth_levels.copy()
-        # Build face depths: surface at 0, then midpoints, then a bottom face
-        z_w_np = np.empty(Nz + 1, dtype=np.float64)
-        z_w_np[0] = 0.0
-        for k in range(1, Nz):
-            z_w_np[k] = 0.5 * (z_c_np[k - 1] + z_c_np[k])
-        # bottom face: extrapolate half a cell below last center
-        z_w_np[Nz] = z_c_np[-1] + 0.5 * (z_c_np[-1] - z_w_np[-2])
+        z_w_np = face_depths(z_c_np)
 
         # cell thicknesses
         dz_c_np = np.diff(z_w_np)              # (Nz,)  positive downward

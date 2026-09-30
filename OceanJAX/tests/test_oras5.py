@@ -750,7 +750,7 @@ class TestFieldSpecificHoriz:
 # ---------------------------------------------------------------------------
 
 _BATHY_DEPTH = np.array([5.0, 15.0, 30.0, 60.0, 100.0])
-# Faces by the OceanGrid.create rule: 0, 10, 22.5, 45, 80, 110
+# Faces by the OceanGrid.create rule: 0, 10, 22.5, 45, 80, 120
 
 
 def _bathy_raw(curvilinear: bool = False, lon0: float = 0.0) -> dict:
@@ -758,7 +758,7 @@ def _bathy_raw(curvilinear: bool = False, lon0: float = 0.0) -> dict:
     Synthetic 0.25° source on lon [lon0, lon0+10], lat [0, 8]:
       lon < lon0+3.5           : land (all NaN)
       lat < 4                  : wet in the top 3 levels  -> depth 45 m
-      lat >= 4                 : wet in all 5 levels      -> depth 110 m
+      lat >= 4                 : wet in all 5 levels      -> depth 120 m
     One column also has a wet level *below* a dry one, which must not
     count (wetness is taken contiguously from the surface).
     """
@@ -790,9 +790,9 @@ class TestOras5Bathymetry:
         assert H.shape == (5, 4)
         # i=0 (lon 0-2) all land; i=1 (lon 2-4) 6/8 land -> land
         assert np.all(H[:2] == 0.0)
-        # ocean columns: lat 0-4 -> 45 m, lat 4-8 -> 110 m
+        # ocean columns: lat 0-4 -> 45 m, lat 4-8 -> 120 m
         np.testing.assert_allclose(H[2:, :2], 45.0)
-        np.testing.assert_allclose(H[2:, 2:], 110.0)
+        np.testing.assert_allclose(H[2:, 2:], 120.0)
 
     def test_grid_mask_from_bathymetry(self):
         """Feeding H back into OceanGrid.create gives the expected mask."""
@@ -801,7 +801,7 @@ class TestOras5Bathymetry:
                                 5, 4, bathymetry=H, periodic_x=False)
         m = np.asarray(grid.mask_c)
         assert np.all(m[:2] == 0.0)                        # land columns
-        # model faces 0, 17.5, 50, 90: H=45 -> 2 wet levels, H=110 -> 3
+        # model faces 0, 17.5, 50, 90: H=45 -> 2 wet levels, H=120 -> 3
         np.testing.assert_array_equal(m[2:, :2].sum(axis=-1), 2)
         np.testing.assert_array_equal(m[2:, 2:].sum(axis=-1), 3)
 
@@ -809,10 +809,44 @@ class TestOras5Bathymetry:
         """Target cells smaller than the source spacing get no NaN."""
         H = oras5_bathymetry(_bathy_raw(), _bathy_grid(Nx=80, Ny=64))
         assert np.all(np.isfinite(H))
-        assert H[0, 0] == 0.0 and H[-1, -1] == 110.0
+        assert H[0, 0] == 0.0 and H[-1, -1] == 120.0
 
     def test_longitude_convention_mismatch(self):
         """Source in 0-360, target in -180-180 (same physical region)."""
         H = oras5_bathymetry(_bathy_raw(lon0=340.0), _bathy_grid(lon=(-20.0, -10.0)))
         assert np.all(H[:2] == 0.0)
-        np.testing.assert_allclose(H[2:, 2:], 110.0)
+        np.testing.assert_allclose(H[2:, 2:], 120.0)
+
+
+# ---------------------------------------------------------------------------
+# oras5_levels — model levels taken from the ORAS5 vertical grid
+# ---------------------------------------------------------------------------
+
+class TestOras5Levels:
+
+    # Roughly ORAS5-like: ~1 m spacing at the top, stretching with depth
+    DEPTHS = np.concatenate([np.arange(0.5, 10.0, 1.0),
+                             10.0 * 1.15 ** np.arange(1, 40)])
+
+    def test_min_thickness_and_bottom(self):
+        from OceanJAX.data.oras5 import oras5_levels
+        from OceanJAX.grid import face_depths
+        c  = oras5_levels(self.DEPTHS, depth_max=2000.0, dz_min=10.0)
+        f  = face_depths(c)
+        assert np.diff(f).min() >= 10.0 - 1e-9
+        assert f[-1] <= 2000.0
+        assert set(c).issubset(set(self.DEPTHS)), "levels are ORAS5 levels"
+        # the next deeper ORAS5 level would have exceeded depth_max
+        deeper = self.DEPTHS[self.DEPTHS > c[-1]]
+        assert face_depths(np.append(c, deeper[0]))[-1] > 2000.0
+
+    def test_accepts_read_oras5_dict(self):
+        from OceanJAX.data.oras5 import oras5_levels
+        a = oras5_levels(self.DEPTHS, 1000.0, 10.0)
+        b = oras5_levels({"depth": self.DEPTHS}, 1000.0, 10.0)
+        np.testing.assert_array_equal(a, b)
+
+    def test_nothing_fits(self):
+        from OceanJAX.data.oras5 import oras5_levels
+        with pytest.raises(ValueError):
+            oras5_levels(self.DEPTHS, depth_max=5.0, dz_min=10.0)

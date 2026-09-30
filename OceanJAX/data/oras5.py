@@ -69,7 +69,7 @@ from scipy.interpolate import (
 )
 from scipy.spatial import Delaunay
 
-from OceanJAX.grid import OceanGrid
+from OceanJAX.grid import OceanGrid, face_depths
 from OceanJAX.state import OceanState, create_from_arrays
 
 
@@ -960,18 +960,52 @@ def load_oras5(
 # Public: oras5_bathymetry
 # ---------------------------------------------------------------------------
 
-def _face_depths(centres: np.ndarray) -> np.ndarray:
+def oras5_levels(
+    depths:    "np.ndarray | dict",
+    depth_max: float,
+    dz_min:    float = 10.0,
+) -> np.ndarray:
     """
-    Cell-face depths (N+1,) from ascending cell-centre depths (N,), using the
-    same construction as ``OceanGrid.create``: surface at 0, midpoints
-    between centres, and a bottom face half a cell below the last centre.
+    Model cell-centre depths (Nz,) [m] taken from the ORAS5 vertical grid.
+
+    Uses ORAS5's own stretched levels (about 1 m thick at the surface,
+    ~200 m at 5000 m), so model and data levels coincide and vertical
+    interpolation error is minimal, with two adjustments:
+
+    * Levels are thinned from the top so that consecutive centres are at
+      least ``dz_min`` apart, which makes every model cell (in particular
+      the top one) at least ``dz_min`` thick.  The linear free surface
+      needs |eta| << top-cell thickness; ORAS5's ~1 m top levels are too
+      thin for that.
+    * Deep levels are dropped until the model bottom face (``face_depths``)
+      lies at or above ``depth_max``.  Keep depth_max within the ORAS5 data
+      (~5900 m): below it T/S would only be extrapolated.
+
+    Args:
+        depths    : ORAS5 T-level depths (ascending, metres), or the dict
+                    returned by ``read_oras5`` (its ``"depth"`` entry).
+        depth_max : maximum model depth [m].
+        dz_min    : minimum cell thickness [m] (default 10).
+
+    Returns:
+        (Nz,) float64 ascending centre depths for OceanGrid.create.
     """
-    n = len(centres)
-    faces = np.empty(n + 1, dtype=np.float64)
-    faces[0] = 0.0
-    faces[1:n] = 0.5 * (centres[:-1] + centres[1:])
-    faces[n] = centres[-1] + 0.5 * (centres[-1] - faces[n - 1])
-    return faces
+    d = np.asarray(depths["depth"] if isinstance(depths, dict) else depths,
+                   dtype=np.float64)
+    d = np.sort(d[np.isfinite(d)])
+    picks = []
+    for z in d:
+        if not picks:
+            if z >= 0.5 * dz_min:
+                picks.append(z)
+        elif z - picks[-1] >= dz_min:
+            picks.append(z)
+    while picks and face_depths(np.array(picks))[-1] > depth_max:
+        picks.pop()
+    if not picks:
+        raise ValueError(f"no ORAS5 level fits dz_min={dz_min} m within "
+                         f"depth_max={depth_max} m")
+    return np.array(picks)
 
 
 def _cell_edges(centres: np.ndarray, upper_faces: np.ndarray) -> np.ndarray:
@@ -1027,7 +1061,7 @@ def oras5_bathymetry(
     # --- source water depth per column -----------------------------------
     wet_contig = np.cumprod(~np.isnan(T), axis=0)  # 1 while wet from surface
     n_wet      = wet_contig.sum(axis=0)            # (Ny_src, Nx_src)
-    src_H      = np.where(n_wet > 0, _face_depths(depth)[n_wet], 0.0)
+    src_H      = np.where(n_wet > 0, face_depths(depth)[n_wet], 0.0)
 
     src_lon, src_lat = raw["lon"], raw["lat"]
     if src_lon.ndim == 1:
