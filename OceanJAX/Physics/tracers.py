@@ -335,20 +335,38 @@ def salt_surface_tendency(
     fw_flux: jnp.ndarray,
     grid:    OceanGrid,
     params,
+    sss:     jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """
     Salinity tendency from net surface freshwater flux (virtual salt flux).
+
+    With a linear free surface the freshwater volume is not added to the
+    ocean; its diluting / concentrating effect on the top layer is applied
+    as a salt flux
+
+      dS/dt|_surf = SSS * (E - P) / dz_c[0]
+
+    using the local sea-surface salinity (as NEMO does for a linear free
+    surface).  Dilution is then proportional to the salinity itself, so a
+    column under strong freshwater input (e.g. a river mouth, whose runoff
+    ORAS5 includes in E - P) freshens exponentially towards 0 and can never
+    become negative.  A fixed reference salinity S_ref in place of SSS
+    removes the same salt however fresh the water already is; in a
+    one-layer Amazon-mouth column that drove SSS to -28 psu in a 2026
+    hindcast.
 
     Args:
         fw_flux : (Nx, Ny) [m s-1]  E - P, positive = net evaporation
                   (freshwater loss → salinity increase)
         grid    : OceanGrid
-        params  : ModelParams  (uses S_ref)
+        params  : ModelParams  (uses S_ref when sss is None)
+        sss     : (Nx, Ny) [psu] top-layer salinity, or None to use the
+                  constant params.S_ref (the original formulation)
 
     Returns:
         dS/dt|_surf : (Nx, Ny, Nz) [psu s-1]
     """
-    # Virtual salt flux: dS/dt = S_ref * (E-P) / dz
     # fw_flux > 0 (evaporation) => ocean loses freshwater => salinity increases
-    flux_per_area = params.S_ref * fw_flux
+    s_surf = params.S_ref if sss is None else jnp.maximum(sss, 0.0)
+    flux_per_area = s_surf * fw_flux
     return surface_layer_tendency(flux_per_area, grid)

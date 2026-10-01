@@ -309,7 +309,9 @@ def step(
 
     if forcing is not None:
         G_T = G_T + heat_surface_tendency(forcing.heat_flux, grid, params)
-        G_S = G_S + salt_surface_tendency(forcing.fw_flux,   grid, params)
+        # Virtual salt flux with the local SSS (dilution proportional to S)
+        G_S = G_S + salt_surface_tendency(forcing.fw_flux,   grid, params,
+                                          sss=state.S[:, :, 0])
 
     # ------------------------------------------------------------------
     # [ML hook] Closure corrections to tracer tendencies and kappa_v.

@@ -319,3 +319,45 @@ class TestSurfaceForcingTendencies:
             f"Salt tendency: expected {expected:.3e} psu/s, "
             f"got {jnp.mean(tend[:,:,0]):.3e} psu/s"
         )
+
+
+class TestVirtualSaltFlux:
+    """Virtual salt flux uses the local SSS: dS/dt = SSS * (E-P) / dz0."""
+
+    def test_local_sss_formula(self, flat_grid, default_params):
+        grid = flat_grid
+        ep   = jnp.full((grid.Nx, grid.Ny), -2e-6)
+        sss  = jnp.linspace(0.0, 36.0, grid.Nx)[:, None] * jnp.ones((1, grid.Ny))
+        tend = salt_surface_tendency(ep, grid, default_params, sss=sss)
+        expected = np.asarray(sss) * -2e-6 / float(grid.dz_c[0])
+        np.testing.assert_allclose(np.asarray(tend[:, :, 0]), expected, rtol=1e-5)
+        assert jnp.all(tend[:, :, 1:] == 0.0)
+
+    def test_matches_reference_formula_at_s_ref(self, flat_grid, default_params):
+        grid = flat_grid
+        ep   = jnp.full((grid.Nx, grid.Ny), 3e-8)
+        sref = jnp.full((grid.Nx, grid.Ny), default_params.S_ref)
+        np.testing.assert_allclose(
+            np.asarray(salt_surface_tendency(ep, grid, default_params, sss=sref)),
+            np.asarray(salt_surface_tendency(ep, grid, default_params)), rtol=1e-6)
+
+    def test_fresh_column_stays_positive(self):
+        """
+        One-layer column, S0 = 5 psu, strong freshwater input E-P = -5e-6 m/s
+        for 60 days (as at a river mouth).  With the local-SSS flux S decays
+        as S0 * exp(-|E-P| t / dz) (~0.5 psu); the old S_ref form would
+        remove 35 * 5e-6 / dz per second and reach about -80 psu.
+        """
+        from OceanJAX.state import ModelParams, create_rest_state
+        from OceanJAX.timeStepping import run, SurfaceForcing
+        grid   = OceanGrid.create((0.0, 4.0), (0.0, 4.0), np.array([5.0]), 2, 2)
+        params = ModelParams(dt=3600.0, kappa_h=0.0)
+        state  = create_rest_state(grid, T_background=20.0, S_background=5.0)
+        n, fw  = 60 * 24, -5e-6
+        z2     = jnp.zeros((n, 2, 2))
+        forcing = SurfaceForcing(heat_flux=z2, fw_flux=z2 + fw, tau_x=z2, tau_y=z2)
+        final, _ = run(state, grid, params, n, forcing_sequence=forcing)
+        S = np.asarray(final.S)[:, :, 0]
+        expected = 5.0 * np.exp(fw / float(grid.dz_c[0]) * n * 3600.0)
+        assert np.all(S > 0.0)
+        np.testing.assert_allclose(S, expected, rtol=0.01)
