@@ -1,5 +1,5 @@
 # Model output and experiment results (large NetCDF files, figures)
-hindcast_output/
+hindcast_output*/
 output_*.nc
 __pycache__/
 *.pyc

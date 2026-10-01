@@ -94,6 +94,7 @@ from OceanJAX.Physics.mixing import (
     implicit_vertical_mix,
     bottom_drag_velocity,
     pp81_coefficients,
+    kpp_coefficients,
 )
 
 
@@ -205,14 +206,15 @@ def step(
     3.  Leapfrog momentum advance:  u_new = u_prev + 2*dt * G_u
     4.  Asselin-Robert filter on u(n):
           u_filt = u + alpha*(u_new - 2*u + u_prev)
-    5.  Vertical mixing coefficients (constant or PP81); implicit vertical
-        viscosity + quadratic bottom drag on u_new, v_new.
+    5.  Vertical mixing coefficients (constant, PP81 or KPP); implicit
+        vertical viscosity + quadratic bottom drag on u_new, v_new.
     6.  Diagnose w from (u_filt, v_filt), bottom-up; w[0] = -deta/dt.
     7.  Explicit tracer tendencies (advection with u_filt, v_filt, w
         + horiz. diffusion) + heat / freshwater surface forcing.
         [ML hook] closure corrections to G_T, G_S and kappa_v (if supplied).
     8.  Adams-Bashforth 3 tracer advance.
-    9.  Implicit vertical diffusion applied to T_new, S_new; freezing-point
+    9.  Implicit vertical diffusion (+ KPP nonlocal transport) applied to
+        T_new, S_new; freezing-point
         limit T >= -freezing_slope * S (if params.limit_freezing).
     10. Free-surface leapfrog: eta_new = eta_prev + 2*dt * deta_dt,
         plus Asselin filter on eta(n).
@@ -274,15 +276,22 @@ def step(
     # 5. Implicit vertical viscosity + quadratic bottom drag
     #    Vertical mixing coefficients are evaluated at time level n:
     #      "constant": params.nu_v / params.kappa_v everywhere;
-    #      "pp81"    : Ri-dependent Pacanowski-Philander + convection
-    #                  (kappa_vmix is reused for the tracers in step 9).
+    #      "pp81"    : Ri-dependent Pacanowski-Philander + convection;
+    #      "kpp"     : KPP surface boundary layer (wind stress + surface
+    #                  buoyancy flux of this step's forcing) over PP81,
+    #                  plus nonlocal tracer tendencies.
+    #    kappa_vmix and the nonlocal terms are used for the tracers in step 9.
     #    Drag velocity Cd*|u_b| is also evaluated at time n (semi-implicit)
     #    and applied implicitly to the deepest wet cell of each column, so
     #    it is unconditionally stable.  bottom_drag_cd = 0 disables it.
     # ------------------------------------------------------------------
+    nonlocal_T = nonlocal_S = None
     if params.vertical_mixing == "pp81":
         kappa_vmix, nu_u, nu_v = pp81_coefficients(
             state.T, state.S, state.u, state.v, grid, params)
+    elif params.vertical_mixing == "kpp":
+        kappa_vmix, nu_u, nu_v, nonlocal_T, nonlocal_S = kpp_coefficients(
+            state.T, state.S, state.u, state.v, forcing, grid, params)
     else:
         kappa_vmix, nu_u, nu_v = params.kappa_v, params.nu_v, params.nu_v
 
@@ -349,11 +358,15 @@ def step(
     # 9. Implicit vertical diffusion
     #    kappa_v is the scheme diffusivity (params.kappa_v, or the PP81
     #    field), times corr.kappa_v_scale when a closure is active.
+    #    KPP's nonlocal transport enters the same implicit step as an
+    #    explicit right-hand side (zero column integral).
     # ------------------------------------------------------------------
+    if nonlocal_T is None:
+        nonlocal_T, nonlocal_S = jnp.zeros_like(T_new), jnp.zeros_like(S_new)
     T_new = implicit_vertical_mix(T_new, kappa_v, dt, grid,
-                                  rhs_explicit=jnp.zeros_like(T_new))
+                                  rhs_explicit=nonlocal_T)
     S_new = implicit_vertical_mix(S_new, kappa_v, dt, grid,
-                                  rhs_explicit=jnp.zeros_like(S_new))
+                                  rhs_explicit=nonlocal_S)
 
     # Freezing-point limit (stand-in for sea ice): T >= -freezing_slope * S.
     # Heat removed below T_f is discarded, as if it went into ice formation.

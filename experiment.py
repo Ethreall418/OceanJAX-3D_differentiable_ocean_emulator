@@ -54,6 +54,9 @@ NU_H = "munk"
 #                where statically unstable, blended in continuously over
 #                -1e-6 < N2 < 0 s-2); constants above as backgrounds.
 #                ModelParams default.
+#   "kpp"      — KPP surface boundary layer (Large et al. 1994: depth from the
+#                bulk Richardson number, deepened by wind and convection,
+#                nonlocal tracer flux) over PP81 in the interior.
 VERTICAL_MIXING = "pp81"
 
 # --- Initial conditions -------------------------------------------------------

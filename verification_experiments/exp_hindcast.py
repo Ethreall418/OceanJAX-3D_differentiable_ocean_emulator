@@ -18,14 +18,15 @@ Setup
     represent 2026-01-16 12:00 (the time stamp of the monthly mean).
   - Forcing: monthly ORAS5 fluxes, January–June, linearly interpolated
     between mid-months (after 16 June the June values are held).
-  - Physics: PP81 vertical mixing, Munk nu_h, quadratic bottom drag,
-    freezing limit.  No SST/SSS restoring (the evaluation target is ORAS5
+  - Physics: PP81 vertical mixing (--mixing kpp adds the KPP surface
+    boundary layer), Munk nu_h, quadratic bottom drag, freezing limit.  No SST/SSS restoring (the evaluation target is ORAS5
     SST itself).
   - dt = 90 s (checked against the barotropic CFL limit at start-up).
   - Output: daily surface fields and calendar-month means of the 3-D state.
 
 usage:
-    python verification_experiments/exp_hindcast.py [--out DIR] [--days N] [--eval-only]
+    python verification_experiments/exp_hindcast.py [--out DIR] [--days N]
+                                                     [--mixing pp81|kpp|constant] [--eval-only]
 
 Outputs (default hindcast_output/, not tracked by git):
     hindcast_daily.nc, hindcast_monthly.nc, hindcast_monthly_eval/
@@ -47,7 +48,7 @@ START = "2026-01-16T12:00"
 END   = "2026-07-01T00:00"
 
 
-def configure(e, out: Path, days: float):
+def configure(e, out: Path, days: float, mixing: str = "pp81"):
     """Set experiment.py's CONFIG block for the hindcast."""
     e.LON, e.LAT = (-80.0, 20.0), (-50.0, 60.0)
     e.NX, e.NY = 100, 80
@@ -58,7 +59,7 @@ def configure(e, out: Path, days: float):
     e.START_DATE = START
     e.N_DAYS = days
     e.FORCING_DIR, e.FORCING_INTERP = "OceanJAX/data/data_oras5", "linear"
-    e.NU_H, e.VERTICAL_MIXING = "munk", "pp81"
+    e.NU_H, e.VERTICAL_MIXING = "munk", mixing
     e.N_ENSEMBLE, e.N_DEVICES_X, e.N_DEVICES_Y = 1, 1, 1
     steps_per_day = int(round(86400 / e.DT))
     e.SAVE_INTERVAL = e.CHUNK_SIZE = steps_per_day
@@ -73,6 +74,8 @@ def main():
     ap.add_argument("--out", default=str(ROOT / "hindcast_output"))
     ap.add_argument("--days", type=float, default=None,
                     help=f"integration length (default: {START} to {END})")
+    ap.add_argument("--mixing", default="pp81", choices=["pp81", "kpp", "constant"],
+                    help="vertical mixing scheme (default: pp81)")
     ap.add_argument("--eval-only", action="store_true")
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
@@ -81,7 +84,7 @@ def main():
 
     if not a.eval_only:
         import experiment as e
-        configure(e, out, days)
+        configure(e, out, days, a.mixing)
         try:
             e.main()
         except SystemExit as exc:

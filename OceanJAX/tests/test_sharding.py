@@ -220,6 +220,24 @@ class TestCorrectness:
             assert d <= tol[name], f"{name}: max |diff| = {d:.3e} > {tol[name]:.0e}"
         assert int(final.step_count) == N_STEPS
 
+    def test_kpp_matches_single_device(self, state, grid, forcing):
+        """KPP (column-local depth search, nonlocal term) under a 2x4 mesh."""
+        p = ModelParams(dt=600.0, nu_h=2e4, vertical_mixing="kpp")
+        ref, _ = jax.jit(run, static_argnames=("n_steps", "save_history"))(
+            state, grid, p, n_steps=N_STEPS, forcing_sequence=forcing)
+        final, _ = sharded_run(state, grid, p, N_STEPS, make_mesh(2, 4),
+                               forcing_sequence=forcing)
+        tol = {"u": 1e-6, "v": 1e-6, "w": 1e-9, "T": 2e-5, "S": 2e-5, "eta": 2e-6}
+        for name in FIELDS:
+            d = _max_abs_diff(final, ref, name)
+            assert d <= tol[name], f"{name}: max |diff| = {d:.3e} > {tol[name]:.0e}"
+        mesh = make_mesh(2, 4)
+        ops = _collectives(_sharded_run_jit, shard_state(state, mesh), shard_grid(grid, mesh),
+                           _traced_params(p), shard_forcing(forcing, mesh, grid),
+                           None, N_STEPS, False, mesh)
+        kinds = {op for op, _ in ops}
+        assert "all-gather" not in kinds and "all-to-all" not in kinds, kinds
+
     def test_rest_state_exactly_preserved(self, grid, params):
         """Uniform T/S at rest, no forcing: stays exactly uniform and at rest."""
         rest = create_rest_state(grid, T_background=12.0, S_background=35.0)

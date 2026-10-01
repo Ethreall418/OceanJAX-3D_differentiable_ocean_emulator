@@ -1,7 +1,7 @@
 # CLAUDE.md — OceanJAX 项目记忆
 
 本文件是跨会话（本地 / cloud session）共享的项目记忆。**每次会话结束前按第 9 节更新并推送。**
-最后更新：2026-09-30（本地会话），WSL2 + GPU 环境、非均匀分层 + CFL 检查、修正底层界面错误；基于 `255a751`。
+最后更新：2026-09-30（本地会话），虚拟盐通量改用当地 SSS、KPP 边界层（`vertical_mixing="kpp"`）、KPP 后报对比；基于 `f35fa76`。
 
 ---
 
@@ -54,7 +54,10 @@ OceanJAX：用 JAX 写的三维可微分海洋模式（Boussinesq 静力原始�
   `verification_experiments/*` 和 `experiment.py` 的 ORAS5 模式**跑不了**（缺数据）。
 - Cloud 环境（2026-09-29）：Python 3.11、JAX 0.10.2、equinox 0.13.8，4 核 CPU，无 GPU。
   依赖需自己装：`pip install --ignore-installed packaging -r requirements.txt`（Debian 自带的 packaging 无法卸载）。
-- 跑测试：`python -m pytest OceanJAX/tests -q`（当前 232 passed；cloud 4 核约 6 min）。
+- 跑测试：`python -m pytest OceanJAX/tests -q`（当前 244 passed，本地约 2.5 min；cloud 4 核约 6 min）。
+- **CPU 利用率低**（任务管理器 10–15%）：时间步串行 + 每步大量小运算（逐层垂直扫描），XLA CPU 不拆线程。
+  可选：同时跑多个实验；或用模拟多设备（`--xla_force_host_platform_device_count=8` + `N_DEVICES_X/Y`）
+  在单机做区域分解多核并行——**加速比未测**（下次做：大西洋 1°、2 天、1/2/4/8 设备）。
   `tests/conftest.py` 设置 `XLA_FLAGS=--xla_force_host_platform_device_count=8`（8 个模拟 CPU 设备），
   单设备代码不受影响；`test_sharding.py` 需要这 8 个设备。
 - 本地 `git stash@{0}`：旧的 OBC 半成品（`dynamics.py`/`tracers.py` 改动）；`OceanJAX/Physics/obc.py` 未跟踪。
@@ -73,7 +76,7 @@ OceanJAX/
 ├── Physics/
 │   ├── dynamics.py  EOS、静水压力、PGF、Coriolis（v_at_u_points / u_at_v_points）、自由面、compute_w
 │   ├── tracers.py   迎风/中心平流、水平扩散、表面热盐强迫
-│   └── mixing.py    增量式隐式垂直求解、底摩擦、水平粘性、munk_viscosity、PP81
+│   └── mixing.py    增量式隐式垂直求解、底摩擦、水平粘性、munk_viscosity、PP81、KPP
 ├── data/
 │   ├── oras5.py            read_oras5、regrid_to_model、oras5_bathymetry、oras5_grid、read/regrid_forcing
 │   ├── forcing.py          make_forcing_sequence、make_synthetic_forcing
@@ -101,6 +104,9 @@ docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多�
 - N² = +(g/ρ₀)(ρ[k] − ρ[k−1])/dz_w（稳定为正）。旧的 `ri_based_diffusivity` 符号错误，已删除。
 - 底摩擦：二次、隐式，`bottom_drag_cd=1e-3`、`bottom_drag_ubg=0.05`，作用于每列最深湿层；Cd=0 与无摩擦逐位一致。
 - 冰点限制：T ≥ −0.0575·S（`limit_freezing=True`）。
+- **虚拟盐通量用当地 SSS**（2026-09-30）：dS/dt = SSS·(E−P)/Δz₀（NEMO 线性自由面做法），
+  `salt_surface_tendency(fw, grid, params, sss=S[:,:,0])`；`sss=None` 时退回旧的 S_ref 形式（仅为兼容）。
+  稀释与盐度成正比，强淡水输入（河口，ORAS5 E−P 含径流）下 SSS 指数趋近 0、不会为负。
 - **ν_h 是随分辨率变化的涡粘性闭合**（不是海水物性）：ORAS5 实验用 `munk_viscosity(grid)` = max(β·Δx³)。
   `ModelParams` 默认 nu_h=200 仅供测试。nu_h=200 在 2° 网格上会导致西边界 2Δ 噪声指数增长。
 - 垂直混合：`ModelParams(vertical_mixing="constant"|"pp81")`，**默认 pp81**（2026-09-29 起）。
@@ -111,7 +117,19 @@ docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多�
   舍入噪声 1e-8 → 1e-10）。**若改非线性 EOS，`buoyancy_and_shear` 必须同步改。**
   已知残留：无剪切时稳定侧 Ri = N²/max(S², 1e-12) 在 N² ~1e-11 内从 0 升到很大，κ 从 0.01 陡降到背景值（PP81 本身的 0/0，未改）。
   需要"只有常数 κ"的测试/实验（κ_v=0 隔离、解析扩散解）必须显式写 `vertical_mixing="constant"`。
-  垂直混合依赖**垂直**分辨率与边界层物理，不依赖水平分辨率；中高纬需要时再上 KPP。
+  垂直混合依赖**垂直**分辨率与边界层物理，不依赖水平分辨率。
+- **KPP**（`vertical_mixing="kpp"`，2026-09-30；Large, McWilliams & Doney 1994）：表层边界层叠加在 PP81（含对流过渡）之上。
+  `mixing.kpp_coefficients(T,S,u,v,forcing,grid,params)` → (kappa, nu_u, nu_v, nonlocal_T, nonlocal_S)；
+  `kpp_boundary_layer_depth` 为诊断。要点：
+  - u* = (|τ|/ρ₀)^½（下限 1e-5）；B0 = g(α_T Q/(ρ₀c_p) − β_S·SSS·(E−P))（> 0 稳定），与表层强迫所用通量完全一致。
+  - h：整体 Ri_b = d(B_r − B(d))/(|V_r − V(d)|² + V_t²) 首次 > `kpp_ri_crit`=0.3 处，在格点中心间线性插值；
+    参考值取最上层；V_t² 为 LMD94 式 (23)（C_v=1.8）；不穿越则 h = 柱深。B0 ≥ 0 时 h ≤ 0.7u*/|f|，
+    B0 > 0 时再 ≤ Monin-Obukhov L；h ≥ 最上层半格。**无强迫时与 PP81 逐位一致**。
+  - 边界层内 K = max(PP81, h·w(σ)·G(σ))，G = σ(1−σ)²（simple shapes，无内部匹配，在 h 处连续）；w_m/w_s 用 LMD94 φ 函数。
+  - B0 < 0 时非局地通量 C_s·G(σ)·F0（C_s≈6.33），作为 `implicit_vertical_mix` 的 rhs_explicit 进入第 9 步，柱积分为零（热盐严格守恒）。
+  - 梯度安全：分支参数先截断再 `where`；L 的分母在 B0 ≤ 0 处替换而非取下限（下限 1e-30 会在 float32 反传中出现 inf·0 = NaN）。
+  - 只用列内运算 + 与 `buoyancy_and_shear` 相同的邻格平均，区域分解下无 all-gather（`test_sharding` 已测）。
+  - 分辨率限制：Ri_b 只在格点中心取值，10 m 分层下 h 的精度约一层。
 - ORAS5 实验：`oras5_grid(raw, LON, LAT, levels, Nx, Ny, periodic_x=False)`（格内 ORAS5 水深中位数）。
 - 多月强迫：`MonthlyForcing(dir, grid, start_date, interp="linear")`，月中为节点线性插值；
   缺月份 → 其他年同月 → 最近月份（目前只有 2026-01 → 永久一月）。只需下载 4 个 2D 文件/月。
@@ -135,8 +153,8 @@ docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多�
 
 ## 6. step() 顺序
 
-1 EOS + p' → 2 动量显式趋势 + 风 → 3 leapfrog → 4 Asselin 得 u_filt → 5 垂直混合系数（constant/PP81）+ 隐式粘性 + 底摩擦
-→ 6 由 u_filt 诊断 w → 7 温盐显式趋势 + 表面强迫 + ML closure → 8 AB3 → 9 隐式垂直扩散 + 冰点限制 → 10 η leapfrog + Asselin → 11 组装
+1 EOS + p' → 2 动量显式趋势 + 风 → 3 leapfrog → 4 Asselin 得 u_filt → 5 垂直混合系数（constant/PP81/KPP）+ 隐式粘性 + 底摩擦
+→ 6 由 u_filt 诊断 w → 7 温盐显式趋势 + 表面强迫 + ML closure → 8 AB3 → 9 隐式垂直扩散（+ KPP 非局地项）+ 冰点限制 → 10 η leapfrog + Asselin → 11 组装
 
 ## 7. 验证与稳定性现状（2026-09-29 本地 ORAS5 重跑；5.1.2、5.1.5 为 constant，其余 PP81）
 
@@ -181,7 +199,17 @@ docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多�
   Q = Q_ORAS5 + γ(SST_ORAS5 − SST)，γ≈40 W/m²/K（用户已理解，**推迟实现**）。
 - ORCA 风应力沿网格 i/j 方向，高纬北大西洋未旋转到东/北。
 - 可变分辨率下 ν_h 应随空间变化（目前全域取最大值）。
-- 中高纬混合层：以后考虑 KPP。
+- 中高纬混合层：KPP 已实现（见第 5 节），但单独作用很小（见下方 KPP 后报）；需配合短波穿透。
+- **短波穿透（下一步，用户已同意做 B）**：净通量拆为短波 + 其余，短波按两波段 Jerlov（R=0.58, h₁=0.35 m, h₂=23 m）
+  分配到各层，海底剩余归最深湿层（守恒）；`SurfaceForcing` 加可选 `sw_flux`，缺省时与现在逐位一致；
+  数据：ERA5 月平均 surface_net_solar_radiation（用户自己从 CDS 下载）。KPP 的 B0 同步改为非穿透 + h 内短波。
+- **Samudra 基线（老师建议，方案待确认）**：m2lines/Samudra，纯数据驱动 ConvNeXt U-Net（135M 参数，PyTorch），
+  OM4 训练，全球 1°、19 层、5 天步长，状态 T/S/u/v + SSH，强迫 τx/τy/hfds/hfds 距平；权重 HF `M2LInES/Samudra`（每个 1.6 GB）。
+  论文只与 OM4 比较（无再分析初始化、无短期预报评估）。方案：WSL 下 Python 3.12 + torch，ORAS5（全球）→ 1° 19 层 Samudra 格式
+  （u/v 旋转、垂直重映射、OM4 掩膜、hfds 距平需 OM4 气候态），1–6 月推演，裁大西洋，与 OceanJAX / 持续性三方比较。
+  零样本迁移（OM4→ORAS5）需在论文中注明。代码已 clone 到会话临时目录，未安装、未下载权重。
+- **ML 接入路线（已向用户解释）**：现有 closure 钩子（dT、dS、kappa_v_scale）；建议先扩展接口（传入 forcing）+ 孪生试验验证梯度链，
+  再做垂直混合 closure 在线训练（`jax.grad` 穿过 `lax.scan`，需 `jax.checkpoint`），真值优先用"完美模式"（高分辨率 OceanJAX 粗化）。
 - OBC：新分支计划（模型完善后再做），半成品在本地 stash。
 - **并行计算**：阶段 A **已完成**（2026-09-29，见第 5、7 节与 `docs/parallel.md`）。
   待办：在真实多 GPU / 多节点集群上实测（`init_distributed` + SLURM 路径尚未实测）与 benchmark 效率；
@@ -228,8 +256,18 @@ docs/parallel.md     并行说明：GSPMD 原理、数值一致性、SLURM 多�
   （10.8 m 表层 + PP81 无风搅混合层加深 + 固定通量无 SST 反馈）；SSH 误差在全场初始化后几天内调整到模式自身平衡、之后不变；
   次表层持续性难超越、有缓慢漂移。
   **负盐度**：亚马孙河口 1 层柱（49.5°W, 0.2°N）SSS 降到 −28 psu——虚拟盐通量用固定 S_ref=35 × (E−P)，
-  ORAS5 淡水通量含河流径流（~−1.5 psu/天）。修复方案：改用当地 SSS（进行中）。
-  后续候选（用户说"以后再考虑"）：SST 反馈（恢复到初始月/气候态而非当月，避免"看答案"）、KPP 混合层。
+  ORAS5 淡水通量含河流径流（~−1.5 psu/天）。**已修复**：改用当地 SSS（见第 5 节）；验证实验结果在显示精度内不变。
+  修复后重跑（`hindcast_output_sssfix/`，PP81）：全程 S_min ≥ 5.96 psu；SST 评分与修复前逐月相同，SSS RMSE 变化 ≤ 0.02。
+- **KPP 后报（2026-09-30，`exp_hindcast.py --mixing kpp`，输出 `hindcast_output_kpp/`，CPU ~17 s/天，稳定）**：
+  与 PP81 相比**改进很小**：SST RMSE 全域 2 月 1.690→1.667、6 月 3.766→3.751；北区（≥20°N）6 月偏差 +4.27→+4.16 °C、
+  RMSE 5.54→5.50；次表层、SSH、流速几乎不变（≤ 0.003）。
+  原因（用 ORAS5 6 月强迫核算，20–60°N）：98% 格点净加热（中位 +137 W/m²）、月平均风 u* 中位 0.71 cm/s
+  → Monin-Obukhov L 中位 13.7 m、43% 格点 L < 10.8 m（表层厚度），KPP 的 h 被 L 限制在约一层之内。
+  根本问题：①全部热通量（含短波）加在表层，短波占加热大头，真实海洋中短波穿透到几十米，
+  且 LMD94 的 B0 应为"非穿透通量 + h 内吸收的短波"（夏季非穿透部分常为冷却 → 夜间对流加深）；
+  ②月平均强迫没有日循环和天气尺度风暴（月平均风应力矢量也低估 |τ|），而混合层加深主要靠这些事件。
+  → 下一步应做**短波穿透**（与 KPP 联动：B0 改用非穿透部分 + h 内短波），需要 ERA5 月平均 `ssr`（ORAS5 无单独短波）。
+  后续候选：SST 反馈（用同时刻 ORAS5 SST 线性化 bulk 公式，γ≈40 W/m²/K，用户已理解"看答案"问题）。
 - **后报检验实验**（用户计划，数据已就绪）：实验 1 = 1 月初始、积分到 2 月，与 ORAS5 2 月比较；
   实验 2 = 逐月强迫积分到 6 月，与 ORAS5 6 月比较。要点：起始 2026-01-16T12:00（月平均代表月中）；
   模式月平均对比 ORAS5 月平均；持续性预报（ORAS5 1 月）作为基准；主实验关闭 SST 恢复项（否则"看答案"）。

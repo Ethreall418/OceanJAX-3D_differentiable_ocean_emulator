@@ -28,6 +28,15 @@ Four groups of properties are verified:
        values where N² < 0; no shear dilution at walls; nu0 = 0 reduces
        to constant mixing; convection overturns an unstable column.
 
+  6. PP81 N² accuracy and the continuous convective blend.
+
+  7. KPP surface boundary layer
+       Velocity scales (neutral, free-convection limit, continuous
+       branches); no forcing is bit-identical to PP81; h grows with the
+       wind and is capped by the Ekman / Monin-Obukhov depths; the
+       nonlocal flux has zero column integral and carries surface cooling
+       downward; a forced run conserves heat; gradients are finite.
+
 Running
 -------
     pytest OceanJAX/tests/test_mixing.py -v
@@ -343,7 +352,7 @@ class TestPP81:
 
     def test_invalid_scheme_rejected(self):
         with pytest.raises(ValueError, match="vertical_mixing"):
-            ModelParams(vertical_mixing="kpp")
+            ModelParams(vertical_mixing="tke")
 
     def test_pp81_is_default(self):
         assert ModelParams().vertical_mixing == "pp81"
@@ -495,3 +504,165 @@ class TestPP81Continuity:
         g = np.asarray(jax.grad(total)(T0))
         assert np.all(np.isfinite(g))
         assert np.abs(g).max() > 0
+
+
+# ---------------------------------------------------------------------------
+# 7. KPP surface boundary layer
+# ---------------------------------------------------------------------------
+
+def _kpp_grid():
+    z = np.array([5.0, 15.0, 25.0, 35.0, 45.0, 60.0, 80.0, 105.0, 135.0, 170.0])
+    return OceanGrid.create((0.0, 3.0), (30.0, 33.0), z, 3, 3)
+
+
+def _kpp_state(grid, mld=20.0, dTdz=-0.02):
+    """Resting column: uniform T above ``mld``, linear stratification below."""
+    from OceanJAX.state import create_from_arrays
+    z  = np.asarray(grid.z_c, np.float64)
+    sh = (grid.Nx, grid.Ny, grid.Nz)
+    T  = np.broadcast_to(20.0 + dTdz * np.maximum(z - mld, 0.0), sh)
+    zeros = np.zeros(sh)
+    return create_from_arrays(grid, zeros, zeros, T, np.full(sh, 35.0),
+                              np.zeros(sh[:2]))
+
+
+def _uniform_forcing(grid, heat=0.0, fw=0.0, tau_x=0.0, tau_y=0.0):
+    from OceanJAX.timeStepping import SurfaceForcing
+    f = lambda x: jnp.full((grid.Nx, grid.Ny), x, jnp.float32)
+    return SurfaceForcing(heat_flux=f(heat), fw_flux=f(fw), tau_x=f(tau_x), tau_y=f(tau_y))
+
+
+def _repeat(forcing, n):
+    return jax.tree_util.tree_map(lambda a: jnp.broadcast_to(a, (n,) + a.shape), forcing)
+
+
+def _kpp_depth(grid, st, forcing, params):
+    from OceanJAX.Physics.mixing import kpp_boundary_layer_depth
+    return float(kpp_boundary_layer_depth(st.T, st.S, st.u, st.v, forcing, grid, params)[1, 1])
+
+
+class TestKPP:
+
+    P = ModelParams(dt=600.0, vertical_mixing="kpp")
+
+    def test_velocity_scales(self):
+        from OceanJAX.Physics.mixing import kpp_velocity_scales
+        ust = jnp.array(0.01)
+        w_m, w_s = kpp_velocity_scales(jnp.array(10.0), ust, jnp.array(0.0))
+        np.testing.assert_allclose([w_m, w_s], 0.4 * 0.01, rtol=1e-6)        # neutral
+        # free convection: w_s -> kappa (c_s kappa d |B0|)^(1/3)
+        _, w_s = kpp_velocity_scales(jnp.array(5.0), jnp.array(1e-5), jnp.array(-1e-7))
+        np.testing.assert_allclose(w_s, 0.4 * (98.96 * 0.4 * 5.0 * 1e-7) ** (1 / 3),
+                                   rtol=1e-4)
+        # the unstable branches join at zeta = -0.2 (momentum) and -1 (scalars)
+        b0 = -ust ** 3 / 0.4                                                  # zeta = -d
+        for d in (0.2, 1.0):
+            lo = kpp_velocity_scales(jnp.array(d * (1 - 1e-4)), ust, b0)
+            hi = kpp_velocity_scales(jnp.array(d * (1 + 1e-4)), ust, b0)
+            np.testing.assert_allclose(lo, hi, rtol=1e-3)
+        # stable: w = kappa u* / (1 + 5 zeta)
+        w_m, _ = kpp_velocity_scales(jnp.array(1.0), ust, -b0)
+        np.testing.assert_allclose(w_m, 0.4 * 0.01 / 6.0, rtol=1e-5)
+
+    def test_no_forcing_is_pp81(self):
+        """u* at its floor and B0 = 0: h is the top half-cell, KPP adds nothing."""
+        grid = _kpp_grid()
+        st   = _kpp_state(grid)
+        pp81 = ModelParams(dt=600.0, vertical_mixing="pp81")
+        for fs in (None, _repeat(_uniform_forcing(grid), 10)):
+            a, _ = run(st, grid, pp81,   10, forcing_sequence=fs)
+            b, _ = run(st, grid, self.P, 10, forcing_sequence=fs)
+            for f in ("u", "v", "T", "S", "eta"):
+                np.testing.assert_array_equal(np.asarray(getattr(a, f)),
+                                              np.asarray(getattr(b, f)), err_msg=f)
+
+    def test_depth_grows_with_wind(self):
+        grid = _kpp_grid()
+        st   = _kpp_state(grid, mld=0.0, dTdz=-0.001)
+        hs = [_kpp_depth(grid, st, _uniform_forcing(grid, tau_x=t), self.P)
+              for t in (0.02, 0.1, 0.3)]
+        assert float(grid.z_c[0]) < hs[0] < hs[1] < hs[2], hs
+
+    def test_convection_deepens_boundary_layer(self):
+        """
+        Cooling: h reaches past the last well-mixed centre (15 m; Ri_b = 0
+        in the 20 m mixed layer), deepens with stronger cooling, and is far
+        deeper than the Ekman-capped neutral h.  Ri_b is sampled at cell
+        centres (5, 15, 25 m) and interpolated, so the resolved h lies
+        between 15 and 25 m rather than exactly below the 20 m base.
+        """
+        grid = _kpp_grid()
+        st   = _kpp_state(grid, mld=20.0)
+        h0   = _kpp_depth(grid, st, _uniform_forcing(grid, tau_x=1e-4), self.P)
+        h50  = _kpp_depth(grid, st, _uniform_forcing(grid, heat=-50.0), self.P)
+        h300 = _kpp_depth(grid, st, _uniform_forcing(grid, heat=-300.0), self.P)
+        assert h0 < 15.0 < h50 < h300 < 25.0, (h0, h50, h300)
+
+    def test_stable_forcing_caps_depth(self):
+        """Heating: h <= Monin-Obukhov length even inside a 60 m mixed layer."""
+        from OceanJAX.Physics.tracers import CP_SEAWATER
+        p    = self.P
+        grid = _kpp_grid()
+        st   = _kpp_state(grid, mld=60.0)
+        tau, q = 0.05, 200.0
+        h = _kpp_depth(grid, st, _uniform_forcing(grid, heat=q, tau_x=tau), p)
+        ustar = np.sqrt(tau / p.rho0)
+        b0    = p.g * p.alpha_T * q / (p.rho0 * CP_SEAWATER)
+        L     = ustar ** 3 / (0.4 * b0)
+        assert h <= L * (1 + 1e-4) and h < 60.0, (h, L)
+
+    def test_nonlocal_flux_and_diffusivity(self):
+        from OceanJAX.Physics.mixing import kpp_coefficients, pp81_coefficients
+        grid = _kpp_grid()
+        st   = _kpp_state(grid, mld=40.0)
+        k_pp, _, _ = pp81_coefficients(st.T, st.S, st.u, st.v, grid, self.P)
+
+        cool = _uniform_forcing(grid, heat=-200.0, fw=1e-7, tau_x=0.05)
+        kappa, _, _, nl_T, nl_S = kpp_coefficients(st.T, st.S, st.u, st.v, cool,
+                                                   grid, self.P)
+        dz = np.asarray(grid.dz_c)
+        for nl in (np.asarray(nl_T), np.asarray(nl_S)):
+            col = np.sum(nl * dz, axis=-1)
+            assert np.abs(nl).max() > 0
+            np.testing.assert_allclose(col, 0.0, atol=1e-6 * np.abs(nl * dz).max())
+        # cooling is carried downward: top cell warmed, cells below cooled
+        nl_T = np.asarray(nl_T)[1, 1]
+        assert nl_T[0] > 0 and nl_T[1:].min() < 0
+        # KPP only raises mixing, and does so inside the boundary layer
+        assert np.all(np.asarray(kappa) >= np.asarray(k_pp))
+        assert np.any(np.asarray(kappa) > np.asarray(k_pp) * 1.01)
+
+        heat = _uniform_forcing(grid, heat=+200.0, tau_x=0.05)
+        _, _, _, nl_T, nl_S = kpp_coefficients(st.T, st.S, st.u, st.v, heat,
+                                               grid, self.P)
+        assert float(jnp.abs(nl_T).max()) == 0.0 and float(jnp.abs(nl_S).max()) == 0.0
+
+    def test_forced_run_conserves_heat(self):
+        from OceanJAX.Physics.tracers import CP_SEAWATER
+        p    = self.P
+        grid = _kpp_grid()
+        st   = _kpp_state(grid, mld=20.0)
+        q, n = -250.0, 144
+        fin, _ = run(st, grid, p, n, forcing_sequence=_repeat(
+            _uniform_forcing(grid, heat=q, tau_x=0.1), n))
+        dH = float(jnp.sum((fin.T - st.T) * grid.volume_c) / jnp.sum(grid.area_c))
+        np.testing.assert_allclose(dH, q * n * p.dt / (p.rho0 * CP_SEAWATER), rtol=1e-3)
+
+    def test_gradient_finite(self):
+        """Mixed columns (convective, neutral, stable) all give finite gradients."""
+        grid = _kpp_grid()
+        st   = _kpp_state(grid, mld=20.0)
+        from OceanJAX.timeStepping import SurfaceForcing
+        heat = jnp.broadcast_to(jnp.array([-200.0, 0.0, 200.0])[:, None], (3, 3))
+        base = SurfaceForcing(heat_flux=heat, fw_flux=jnp.zeros((3, 3)),
+                              tau_x=jnp.full((3, 3), 0.1), tau_y=jnp.zeros((3, 3)))
+        n = 12
+
+        def loss(scale):
+            f = SurfaceForcing(base.heat_flux * scale, base.fw_flux,
+                               base.tau_x * scale, base.tau_y)
+            fin, _ = run(st, grid, self.P, n, forcing_sequence=_repeat(f, n))
+            return jnp.sum(fin.T[..., 2]) + jnp.sum(fin.u[..., 1])
+
+        g = float(jax.grad(loss)(1.0))
+        assert np.isfinite(g) and g != 0.0

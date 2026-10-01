@@ -37,6 +37,9 @@ munk_viscosity            – resolution-dependent nu_h resolving the Munk layer
 buoyancy_and_shear        – N² and S² aligned at tracer w-faces
 richardson_number         – gradient Richardson number (diagnostic, unclipped)
 pp81_coefficients         – Pacanowski–Philander (1981) nu, kappa + convection
+kpp_coefficients          – KPP surface boundary layer (LMD94) on top of PP81,
+                            with nonlocal tracer transport
+kpp_boundary_layer_depth  – diagnostic KPP boundary-layer depth
 """
 
 from __future__ import annotations
@@ -731,6 +734,19 @@ def pp81_coefficients(
     nu_v  : (Nx, Ny, Nz+1) viscosity at v-column w-faces
     """
     n2, s2 = buoyancy_and_shear(T, S, u, v, grid, params)
+    kappa, nu = _pp81_tracer_faces(n2, s2, grid, params)
+    nu_u, nu_v = _tracer_to_velocity_faces(nu, grid)
+    return kappa, nu_u, nu_v
+
+
+def _pp81_tracer_faces(
+    n2:   jnp.ndarray,
+    s2:   jnp.ndarray,
+    grid: OceanGrid,
+    params,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """PP81 + convective blend (see ``pp81_coefficients``): kappa and nu at
+    tracer w-faces, each (Nx, Ny, Nz+1)."""
     stable = n2 >= 0.0
     ri     = jnp.where(stable, n2 / jnp.maximum(s2, _S2_FLOOR), 0.0)
     f      = 1.0 / (1.0 + params.pp81_alpha * ri)
@@ -745,13 +761,274 @@ def pp81_coefficients(
     conv = params.vmix_convective
     nu    = ((1.0 - w) * nu_pp    + w * conv) * grid.mask_w
     kappa = ((1.0 - w) * kappa_pp + w * conv) * grid.mask_w
+    return kappa, nu
 
-    # Viscosity at u / v columns: mean of the adjacent tracer columns over
-    # their wet faces (the velocity solver applies its own face mask).
+
+def _tracer_to_velocity_faces(
+    nu:   jnp.ndarray,
+    grid: OceanGrid,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Viscosity at u / v columns: mean of the two adjacent tracer columns over
+    their wet faces (the velocity solver applies its own face mask).
+    """
     mw   = grid.mask_w
     nu_e, mw_e = jnp.roll(nu, -1, axis=0), jnp.roll(mw, -1, axis=0)
     nu_n = jnp.concatenate([nu[:, 1:], nu[:, -1:]], axis=1)
     mw_n = jnp.concatenate([mw[:, 1:], mw[:, -1:]], axis=1)
     nu_u = (nu + nu_e) / jnp.maximum(mw + mw_e, 1.0)
     nu_v = (nu + nu_n) / jnp.maximum(mw + mw_n, 1.0)
-    return kappa, nu_u, nu_v
+    return nu_u, nu_v
+
+
+# ---------------------------------------------------------------------------
+# K-profile parameterisation (Large, McWilliams & Doney 1994, "LMD94")
+# ---------------------------------------------------------------------------
+
+_VON_KARMAN = 0.4
+_KPP_EPS    = 0.1                   # surface layer = top eps*h of the boundary layer
+_KPP_CV     = 1.8                   # N_entrainment / N for the unresolved shear
+_KPP_BETA_T = -0.2                  # entrainment / surface buoyancy flux ratio
+_KPP_ZETA_M, _KPP_A_M, _KPP_C_M = -0.2, 1.26,   8.38    # momentum, unstable
+_KPP_ZETA_S, _KPP_A_S, _KPP_C_S = -1.0, -28.86, 98.96   # scalars,  unstable
+_KPP_CSTAR  = 10.0                  # nonlocal transport constant C*
+_KPP_EKMAN  = 0.7                   # stable limit h <= 0.7 u*/|f|
+_USTAR_MIN  = 1e-5                  # [m s⁻¹] floor on u*, keeps zeta finite
+
+# Nonlocal coefficient C_s = C* kappa (c_s kappa eps)^(1/3)   (~6.33)
+_KPP_CS_NL = _KPP_CSTAR * _VON_KARMAN * (_KPP_C_S * _VON_KARMAN * _KPP_EPS) ** (1.0 / 3.0)
+# Unresolved turbulent shear  V_t² = coef * d * N * w_s   (LMD94 eq. 23)
+_KPP_VT2 = float(_KPP_CV * np.sqrt(-_KPP_BETA_T) / _VON_KARMAN ** 2
+                 / np.sqrt(_KPP_C_S * _KPP_EPS))
+
+
+def kpp_velocity_scales(
+    d:     jnp.ndarray,
+    ustar: jnp.ndarray,
+    bflux: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    KPP turbulent velocity scales w_m, w_s = kappa u* / phi(zeta) [m s⁻¹].
+
+    zeta = d / L with the Monin-Obukhov length L = u*³ / (kappa B0), where
+    B0 [m² s⁻³] is the surface buoyancy flux into the ocean (> 0 stable,
+    < 0 convective).  The caller limits d to eps*h in unstable conditions.
+
+      stable   (zeta >= 0) : phi_m = phi_s = 1 + 5 zeta
+      unstable (zeta <  0) : phi_m = (1 - 16 zeta)^(-1/4)        zeta >= -0.2
+                                     (1.26 - 8.38 zeta)^(-1/3)    otherwise
+                             phi_s = (1 - 16 zeta)^(-1/2)        zeta >= -1.0
+                                     (-28.86 - 98.96 zeta)^(-1/3) otherwise
+
+    The branches join continuously.  In the free-convection limit u* -> 0,
+    w_s -> kappa (c_s kappa d |B0|)^(1/3) (finite; u* is floored at 1e-5).
+    Each branch is evaluated on a clipped argument so that the unused
+    branch of ``jnp.where`` never produces NaN (safe for gradients).
+    """
+    zeta = _VON_KARMAN * d * bflux / ustar ** 3
+    zs   = jnp.maximum(zeta, 0.0)
+    zu   = jnp.minimum(zeta, 0.0)
+    inv_phi_st = 1.0 / (1.0 + 5.0 * zs)
+    inv_phi_m = jnp.where(
+        zu >= _KPP_ZETA_M,
+        (1.0 - 16.0 * zu) ** 0.25,
+        (_KPP_A_M - _KPP_C_M * zu) ** (1.0 / 3.0))
+    inv_phi_s = jnp.where(
+        zu >= _KPP_ZETA_S,
+        (1.0 - 16.0 * zu) ** 0.5,
+        (_KPP_A_S - _KPP_C_S * jnp.minimum(zu, _KPP_ZETA_S)) ** (1.0 / 3.0))
+    stable = zeta >= 0.0
+    w_m = _VON_KARMAN * ustar * jnp.where(stable, inv_phi_st, inv_phi_m)
+    w_s = _VON_KARMAN * ustar * jnp.where(stable, inv_phi_st, inv_phi_s)
+    return w_m, w_s
+
+
+def kpp_surface_fluxes(
+    forcing,
+    sss:    jnp.ndarray,
+    params,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Surface quantities for KPP, each (Nx, Ny):
+
+      ustar = (|tau| / rho0)^(1/2)          friction velocity, floored at 1e-5
+      F_T   = Q / (rho0 cp)                 downward kinematic heat flux [K m s⁻¹]
+      F_S   = SSS (E - P)                   downward kinematic salt flux [psu m s⁻¹]
+      B0    = g (alpha_T F_T - beta_S F_S)  buoyancy flux into the ocean [m² s⁻³]
+
+    F_T and F_S are exactly the fluxes the surface forcing applies to the
+    top layer (``tracers.heat_surface_tendency`` / ``salt_surface_tendency``
+    with the local SSS).  ``forcing=None`` gives u* = floor and zero fluxes.
+    """
+    from OceanJAX.Physics.tracers import CP_SEAWATER    # deferred
+
+    if forcing is None:
+        zeros = jnp.zeros_like(sss)
+        return jnp.full_like(sss, _USTAR_MIN), zeros, zeros, zeros
+    tau2  = forcing.tau_x ** 2 + forcing.tau_y ** 2
+    # (|tau| / rho0)^(1/2) = (tau² / rho0²)^(1/4); the floor also avoids the
+    # infinite derivative of the root at zero stress.
+    ustar = jnp.maximum(tau2 / params.rho0 ** 2, _USTAR_MIN ** 4) ** 0.25
+    f_t   = forcing.heat_flux / (params.rho0 * CP_SEAWATER)
+    f_s   = jnp.maximum(sss, 0.0) * forcing.fw_flux
+    b0    = params.g * (params.alpha_T * f_t - params.beta_S * f_s)
+    return ustar, f_t, f_s, b0
+
+
+def _centre_velocity(vel: jnp.ndarray, mask: jnp.ndarray, axis: int) -> jnp.ndarray:
+    """Mean of the two faces of each tracer cell along ``axis`` (0: u, 1: v),
+    over wet faces only (same staggering as ``buoyancy_and_shear``)."""
+    vm = vel * mask
+    if axis == 0:
+        vm_b, m_b = jnp.roll(vm, 1, axis=0), jnp.roll(mask, 1, axis=0)
+    else:
+        pad = lambda a: jnp.concatenate([jnp.zeros_like(a[:, :1]), a[:, :-1]], axis=1)
+        vm_b, m_b = pad(vm), pad(mask)
+    return (vm + vm_b) / jnp.maximum(mask + m_b, 1.0)
+
+
+def _kpp_core(T, S, u, v, forcing, grid: OceanGrid, params) -> dict:
+    """Shared KPP computation; see ``kpp_coefficients``."""
+    Nz = grid.Nz
+    mc = grid.mask_c
+    n2, s2 = buoyancy_and_shear(T, S, u, v, grid, params)
+    kappa_int, nu_int = _pp81_tracer_faces(n2, s2, grid, params)
+    ustar, f_t, f_s, b0 = kpp_surface_fluxes(forcing, S[:, :, 0], params)
+    us3, b03 = ustar[..., None], b0[..., None]
+
+    # ---- bulk Richardson number at cell centres (reference = top cell) ----
+    u_c = _centre_velocity(u, grid.mask_u, 0)
+    v_c = _centre_velocity(v, grid.mask_v, 1)
+    d_b = params.g * (params.alpha_T * (T[..., :1] - T)
+                      - params.beta_S * (S[..., :1] - S))        # B_r - B(d)
+    dv2 = (u_c[..., :1] - u_c) ** 2 + (v_c[..., :1] - v_c) ** 2
+    n2c = 0.5 * (n2[..., :-1] + n2[..., 1:])
+    n_c = jnp.sqrt(jnp.maximum(n2c, 1e-20))
+    d   = jnp.broadcast_to(grid.z_c, T.shape)
+    d_eval = jnp.where(b03 < 0.0, _KPP_EPS * d, d)
+    _, ws_d = kpp_velocity_scales(d_eval, us3, b03)
+    vt2  = _KPP_VT2 * d * n_c * ws_d
+    ri_b = d * d_b / (dv2 + vt2 + 1e-10)
+
+    # ---- boundary-layer depth: first centre where Ri_b > Ri_c -------------
+    # Dry cells count as a crossing and a sentinel at k = Nz closes full
+    # columns; a crossing at a dry index kc means h = its top face, i.e.
+    # the column depth.
+    ones   = jnp.ones(T.shape[:2] + (1,), dtype=bool)
+    exceed = jnp.concatenate([(ri_b > params.kpp_ri_crit) | (mc == 0), ones], axis=-1)
+    kc     = jnp.argmax(exceed, axis=-1)                           # (Nx, Ny)
+    k_hi   = jnp.minimum(kc, Nz - 1)
+    k_lo   = jnp.maximum(kc - 1, 0)
+    rb_hi  = jnp.take_along_axis(ri_b, k_hi[..., None], axis=-1)[..., 0]
+    rb_lo  = jnp.take_along_axis(ri_b, k_lo[..., None], axis=-1)[..., 0]
+    z_hi, z_lo = grid.z_c[k_hi], grid.z_c[k_lo]
+    den    = rb_hi - rb_lo
+    frac   = jnp.clip((params.kpp_ri_crit - rb_lo)
+                      / jnp.where(den > 0.0, den, 1.0), 0.0, 1.0)
+    mc_ext = jnp.concatenate([mc, jnp.zeros_like(mc[..., :1])], axis=-1)
+    wet_kc = jnp.take_along_axis(mc_ext, kc[..., None], axis=-1)[..., 0] > 0
+    h = jnp.where(wet_kc, z_lo + frac * (z_hi - z_lo), grid.z_w[kc])
+
+    # Neutral / stabilising forcing (B0 >= 0): h <= Ekman depth 0.7 u*/|f|,
+    # and h <= Monin-Obukhov length L = u*³ / (kappa B0) when B0 > 0.
+    # (L's denominator is replaced, not floored, where B0 <= 0: a floor of
+    # 1e-30 gives an inf * 0 = NaN derivative in float32.)
+    h_ek = _KPP_EKMAN * ustar / jnp.maximum(jnp.abs(grid.f_c), 1e-10)
+    pos  = b0 > 0.0
+    h_mo = jnp.where(pos, ustar ** 3 / (_VON_KARMAN * jnp.where(pos, b0, 1.0)), 1e10)
+    h = jnp.where(b0 >= 0.0, jnp.minimum(h, jnp.minimum(h_ek, h_mo)), h)
+    h = jnp.maximum(h, grid.z_c[0])        # at least the top half-cell
+    h3 = h[..., None]
+
+    # ---- K profile K = h w(sigma) G(sigma), G = sigma (1 - sigma)² --------
+    z_w    = jnp.broadcast_to(grid.z_w, grid.mask_w.shape)
+    sigma  = z_w / h3
+    shape  = jnp.where(sigma < 1.0, sigma * (1.0 - sigma) ** 2, 0.0)
+    d_face = jnp.where(b03 < 0.0, jnp.minimum(z_w, _KPP_EPS * h3), z_w)
+    w_m, w_s = kpp_velocity_scales(d_face, us3, b03)
+    kappa = jnp.maximum(kappa_int, h3 * w_s * shape) * grid.mask_w
+    nu    = jnp.maximum(nu_int,    h3 * w_m * shape) * grid.mask_w
+
+    # ---- nonlocal tracer transport (convective forcing only) --------------
+    # Downward flux C_s G(sigma) F0 at each face: zero at the surface
+    # (G(0) = 0) and at and below h (G = 0), so it only redistributes the
+    # surface flux within the column and conserves heat and salt exactly.
+    nl_shape = jnp.where(b03 < 0.0, _KPP_CS_NL * shape, 0.0) * grid.mask_w_adv
+
+    def _nonlocal(f0):
+        flux = nl_shape * f0[..., None]
+        return (flux[..., :-1] - flux[..., 1:]) / grid.dz_c * mc
+
+    return dict(kappa=kappa, nu=nu, nl_T=_nonlocal(f_t), nl_S=_nonlocal(f_s),
+                hbl=h * mc[..., 0])
+
+
+def kpp_coefficients(
+    T:       jnp.ndarray,
+    S:       jnp.ndarray,
+    u:       jnp.ndarray,
+    v:       jnp.ndarray,
+    forcing,
+    grid:    OceanGrid,
+    params,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    K-profile parameterisation (Large, McWilliams & Doney 1994) for the
+    surface boundary layer, on top of PP81 + convection in the interior.
+
+    1. Surface forcing: friction velocity u* from the wind stress and the
+       buoyancy flux B0 from the heat and freshwater fluxes
+       (``kpp_surface_fluxes``); ``forcing`` is a ``SurfaceForcing`` or None.
+    2. Boundary-layer depth h: the shallowest depth d at which the bulk
+       Richardson number
+
+         Ri_b(d) = d (B_r - B(d)) / (|V_r - V(d)|² + V_t²(d))
+
+       reaches ``params.kpp_ri_crit`` (0.3), linearly interpolated between
+       cell centres.  The reference B_r, V_r is the top cell; V_t² is the
+       unresolved turbulent shear of LMD94 eq. (23).  Wind (through V_r - V
+       and u* in V_t) and convection (through w_s in V_t) deepen h.  Under
+       neutral or stabilising forcing (B0 >= 0) h is limited by the Ekman
+       depth 0.7 u*/|f|, and for B0 > 0 by the Monin-Obukhov length.  If
+       Ri_b stays below critical, h is the column depth.  h is at least
+       the top half-cell.  Without forcing (u* at its 1e-5 floor, B0 = 0)
+       h is the top half-cell and the scheme reduces exactly to PP81.
+    3. Inside the boundary layer (sigma = depth / h < 1)
+
+         kappa = max(PP81, h w_s(sigma) G(sigma)),   nu = max(PP81, h w_m G)
+
+       with G = sigma (1 - sigma)² ("simple shapes", no matching to the
+       interior; continuous at h since G(1) = 0).  Below h the PP81 values
+       (with the convective blend) are used unchanged.
+    4. Convective forcing (B0 < 0) adds the nonlocal tracer flux
+       C_s G(sigma) F0 (C_s ~ 6.33), which carries part of the surface
+       flux F0 into the boundary layer; it is returned as tendencies
+       [tracer s⁻¹] with zero column integral.
+
+    All heat is applied at the surface (no shortwave penetration yet), so
+    B0 uses the total net heat flux.  Everything is column-local (z is
+    never sharded), so the scheme runs unchanged under domain decomposition.
+
+    Returns
+    -------
+    kappa      : (Nx, Ny, Nz+1) tracer diffusivity at tracer w-faces [m² s⁻¹]
+    nu_u, nu_v : (Nx, Ny, Nz+1) viscosity at u- / v-column w-faces
+    nonlocal_T : (Nx, Ny, Nz)   nonlocal T tendency [K s⁻¹]
+    nonlocal_S : (Nx, Ny, Nz)   nonlocal S tendency [psu s⁻¹]
+    """
+    out = _kpp_core(T, S, u, v, forcing, grid, params)
+    nu_u, nu_v = _tracer_to_velocity_faces(out["nu"], grid)
+    return out["kappa"], nu_u, nu_v, out["nl_T"], out["nl_S"]
+
+
+def kpp_boundary_layer_depth(
+    T:       jnp.ndarray,
+    S:       jnp.ndarray,
+    u:       jnp.ndarray,
+    v:       jnp.ndarray,
+    forcing,
+    grid:    OceanGrid,
+    params,
+) -> jnp.ndarray:
+    """Diagnostic KPP boundary-layer depth h (Nx, Ny) [m]; 0 on land."""
+    return _kpp_core(T, S, u, v, forcing, grid, params)["hbl"]
